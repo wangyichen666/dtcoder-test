@@ -143,7 +143,7 @@ struct TuiState {
     history_cursor: Option<usize>,
     active_turns: Vec<ActiveTurn>,
     recovery_active_requests: Vec<RequestId>,
-    queued_turns: VecDeque<String>,
+    queued_count: usize,
     pending_approvals: VecDeque<PendingApprovalInfo>,
     approval_scroll: usize,
     status: String,
@@ -191,7 +191,7 @@ impl TuiState {
             history_cursor: None,
             active_turns: Vec::new(),
             recovery_active_requests: snapshot.active_requests,
-            queued_turns: VecDeque::new(),
+            queued_count: 0,
             pending_approvals: snapshot.pending_approvals.into(),
             approval_scroll: 0,
             status: if has_active {
@@ -533,6 +533,15 @@ pub async fn run_tui(client: DaemonClient, workspace: &std::path::Path) -> Resul
     let snapshot = recovery::start_new_session(&client).await?;
     let session_id = snapshot.session_id.clone();
     let mut state = TuiState::from_snapshot(snapshot);
+    if let Ok(queued) = crate::entry::cli::request_result(
+        &client,
+        "queue.list",
+        json!({"session_id": state.session_id}),
+    )
+    .await
+    {
+        state.queued_count = queued["items"].as_array().map_or(0, Vec::len);
+    }
     let mut recovery_failures = 0_usize;
     for request_id in std::mem::take(&mut state.recovery_active_requests) {
         match recovery::subscribe_for_session(&client, &request_id, &session_id).await {
@@ -667,8 +676,18 @@ async fn run_event_loop(
             };
             match next {
                 Some(Some(frame)) => {
+                    let prior_active = state.active_turns.len();
                     handle_frame(state, &request_id, frame).await?;
-                    start_next_turn(client, state).await?;
+                    if state.active_turns.len() < prior_active
+                        && let Ok(queued) = crate::entry::cli::request_result(
+                            client,
+                            "queue.list",
+                            json!({"session_id": state.session_id}),
+                        )
+                        .await
+                    {
+                        state.queued_count = queued["items"].as_array().map_or(0, Vec::len);
+                    }
                     dirty = true;
                     idle_checks = 0;
                     if state
@@ -755,8 +774,29 @@ async fn handle_key(client: &DaemonClient, state: &mut TuiState, key: KeyEvent) 
         return Ok(());
     }
     if action == Some(TuiAction::ClearQueue) {
-        let cleared = state.queued_turns.len();
-        state.queued_turns.clear();
+        let listed = crate::entry::cli::request_result(
+            client,
+            "queue.list",
+            json!({"session_id": state.session_id}),
+        )
+        .await?;
+        let mut cleared = 0;
+        if let Some(items) = listed["items"].as_array() {
+            for item in items {
+                if let Some(run_id) = item["run_id"].as_str() {
+                    let result = crate::entry::cli::request_result(
+                        client,
+                        "queue.remove",
+                        json!({"session_id": state.session_id, "run_id": run_id}),
+                    )
+                    .await?;
+                    if result["cancelled"] == true {
+                        cleared += 1;
+                    }
+                }
+            }
+        }
+        state.queued_count = state.queued_count.saturating_sub(cleared);
         state.status = if cleared == 0 {
             "发送队列为空".to_owned()
         } else {
@@ -977,27 +1017,6 @@ async fn submit_input(client: &DaemonClient, state: &mut TuiState, message: Stri
 
     state.resume_choices.clear();
     state.push_user(message.clone());
-    if !state.active_turns.is_empty()
-        || !state.recovery_active_requests.is_empty()
-        || !state.pending_approvals.is_empty()
-    {
-        state.queued_turns.push_back(message);
-        state.status = format!("已排队，前方还有 {} 条消息", state.queued_turns.len());
-        return Ok(());
-    }
-    begin_turn(client, state, message).await
-}
-
-async fn start_next_turn(client: &DaemonClient, state: &mut TuiState) -> Result<()> {
-    if !state.active_turns.is_empty()
-        || !state.recovery_active_requests.is_empty()
-        || !state.pending_approvals.is_empty()
-    {
-        return Ok(());
-    }
-    let Some(message) = state.queued_turns.pop_front() else {
-        return Ok(());
-    };
     begin_turn(client, state, message).await
 }
 
@@ -1012,14 +1031,15 @@ async fn begin_turn(client: &DaemonClient, state: &mut TuiState, message: String
     let request_label = format!("{request_id:?}");
     state.set_turn_phase(&request_id, ActivityPhase::WaitingModel);
     state.active_turns.push(ActiveTurn { request_id, stream });
-    state.status = if state.queued_turns.is_empty() {
-        format!("等待模型响应 · request={request_label}")
-    } else {
-        format!(
-            "等待模型响应 · request={request_label} · 队列 {}",
-            state.queued_turns.len()
-        )
-    };
+    let queued = crate::entry::cli::request_result(
+        client,
+        "queue.list",
+        json!({"session_id": state.session_id}),
+    )
+    .await?;
+    let count = queued["items"].as_array().map_or(0, Vec::len);
+    state.queued_count = count;
+    state.status = format!("等待模型响应 · request={request_label} · 队列 {count}");
     Ok(())
 }
 

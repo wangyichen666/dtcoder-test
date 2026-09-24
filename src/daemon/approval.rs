@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::protocol::{EventFrame, EventKind, RequestId, ServerFrame};
 use crate::safety::Approval;
+use crate::storage::{InteractionRecord, RuntimeError};
 
 tokio::task_local! {
     static ACTIVE_APPROVAL_CONTEXT: ApprovalContext;
@@ -96,6 +97,7 @@ impl ApprovalBroker {
             .await
     }
 
+    #[cfg(test)]
     pub async fn respond(&self, approval_id: &str, approved: bool) -> Result<()> {
         let Some(pending) = self.inner.pending.lock().await.remove(approval_id) else {
             bail!("找不到待审批项: {approval_id}");
@@ -106,8 +108,23 @@ impl ApprovalBroker {
             .map_err(|_| anyhow::anyhow!("审批请求已结束: {approval_id}"))
     }
 
-    pub async fn cancel_request(&self, request_id: &RequestId) {
-        self.cancel_matching(None, request_id).await;
+    pub async fn respond_claimed(
+        &self,
+        approval_id: &str,
+        approved: bool,
+        claim: impl FnOnce() -> std::result::Result<InteractionRecord, RuntimeError>,
+    ) -> Result<InteractionRecord> {
+        let mut pending = self.inner.pending.lock().await;
+        if !pending.contains_key(approval_id) {
+            bail!("审批执行体不存在: {approval_id}");
+        }
+        let record = claim()?;
+        let waiter = pending.remove(approval_id).expect("checked pending");
+        waiter
+            .response
+            .send(approved)
+            .map_err(|_| anyhow::anyhow!("审批执行体已消失: {approval_id}"))?;
+        Ok(record)
     }
 
     pub async fn cancel_request_in_session(&self, session_id: &str, request_id: &RequestId) {

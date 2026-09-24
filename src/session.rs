@@ -469,6 +469,16 @@ impl SessionStore {
         Ok(Self::with_current_path(self.base_path.clone(), target))
     }
 
+    /// Reopen a session whose durable control row exists even when its first JSONL
+    /// message had not yet been written at the time of a daemon crash.
+    pub fn open_known_session(&self, session_id: &str) -> Result<Self> {
+        self.validate_session_id(session_id)?;
+        Ok(Self::with_current_path(
+            self.base_path.clone(),
+            self.session_path(session_id),
+        ))
+    }
+
     /// Allocate a fresh session without touching the workspace-wide current
     /// pointer. This path is safe while another window is actively writing the
     /// default session.

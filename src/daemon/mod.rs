@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 use self::approval::ApprovalBroker;
 use self::protocol::{EventFrame, EventKind, JsonRpcResponse, RequestId, ServerFrame};
@@ -32,6 +32,8 @@ pub struct DaemonState {
     pub(crate) approvals: ApprovalBroker,
     pub(crate) safety: Option<Arc<SafetyPolicy>>,
     pub(crate) active: Mutex<HashMap<ActiveKey, ActiveRequest>>,
+    pub(crate) queue_notify: Notify,
+    pub(crate) control_lock: Mutex<()>,
     pub(crate) run_store: Arc<RunStore>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) skills: Option<SkillLibrary>,
@@ -287,6 +289,8 @@ impl DaemonState {
             approvals,
             safety,
             active: Mutex::new(HashMap::new()),
+            queue_notify: Notify::new(),
+            control_lock: Mutex::new(()),
             run_store,
             shutdown: CancellationToken::new(),
             skills,

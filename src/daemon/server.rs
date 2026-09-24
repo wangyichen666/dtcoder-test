@@ -107,6 +107,20 @@ pub async fn run_unix_server(
     }
 
     state.shutdown.cancel();
+    let active = state
+        .active
+        .lock()
+        .await
+        .iter()
+        .map(|(key, request)| (key.clone(), request.cancellation.clone()))
+        .collect::<Vec<_>>();
+    for (key, token) in active {
+        token.cancel();
+        state
+            .approvals
+            .cancel_request_in_session(&key.session_id, &key.request_id)
+            .await;
+    }
     while state.has_active_turns().await {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -271,6 +285,57 @@ mod tests {
         provider: Arc<dyn Provider>,
     ) -> (Arc<DaemonState>, std::path::PathBuf) {
         state_with_provider_and_skills(provider, None).await
+    }
+
+    #[tokio::test]
+    async fn subscribe_gap_returns_snapshot_and_page_cursor() {
+        let provider = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let (state, session_path) = state_with_provider(provider).await;
+        let session_id = state.default_session.id.clone();
+        let crate::storage::Admission::New(run) = state
+            .run_store
+            .admit(
+                crate::storage::SessionId(session_id.clone()),
+                RequestId::Number(77),
+                "gap",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        for index in 0..1000 {
+            state
+                .run_store
+                .append_event(&run.run_id, "text_delta", &json!({"delta": index}))
+                .unwrap();
+        }
+        let client = InMemoryServer::start(state);
+        let mut subscribed = client
+            .request(
+                "agent.subscribe",
+                json!({"request_id":77,"session_id":session_id,"after_seq":0}),
+            )
+            .await
+            .unwrap();
+        let Some(ServerFrame::Response(response)) = subscribed.next().await else {
+            panic!("resync response")
+        };
+        let data = response.error.unwrap().data.unwrap();
+        assert_eq!(data["kind"], "resync_required");
+        assert_eq!(data["snapshot"]["run_id"], run.run_id.0);
+        assert_eq!(data["last_seq"], 1001);
+        assert_eq!(data["cursor"], 1000);
+        let page = crate::entry::cli::request_result(
+            &client,
+            "run.events",
+            json!({"run_id":run.run_id,"after_seq":1000,"limit":200}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["events"][0]["seq"], 1001);
+        let _ = std::fs::remove_file(session_path);
     }
 
     async fn state_with_provider_and_skills(
@@ -905,6 +970,18 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let session_id = snapshot["session_id"].as_str().unwrap();
+        let mut interactions = client
+            .request("interaction.list", json!({"session_id":session_id}))
+            .await
+            .unwrap();
+        let Some(ServerFrame::Response(listed)) = interactions.next().await else {
+            panic!("interaction list")
+        };
+        let interaction = &listed.result.unwrap()["interactions"][0];
+        assert_eq!(interaction["interaction_id"], approval_id);
+        assert_eq!(interaction["status"], "pending");
+        let owner_run_id = interaction["owner_run_id"].as_str().unwrap().to_owned();
 
         let mut subscription = client
             .request("agent.subscribe", json!({"request_id": original_id}))
@@ -924,6 +1001,22 @@ mod tests {
                 .expect("审批响应流提前关闭"),
             ServerFrame::Response(JsonRpcResponse { error: None, .. })
         ));
+        let params = json!({"interaction_id": approval_id, "session_id": session_id,
+            "owner_run_id": owner_run_id, "revision": 0, "approved": true});
+        let mut repeated = client
+            .request("interaction.respond", params.clone())
+            .await
+            .unwrap();
+        let Some(ServerFrame::Response(repeated)) = repeated.next().await else {
+            panic!("duplicate interaction")
+        };
+        assert!(repeated.error.is_none());
+        let mut conflicting = client.request("interaction.respond", json!({"interaction_id": approval_id,
+            "session_id": session_id, "owner_run_id": owner_run_id, "revision": 1, "approved": false})).await.unwrap();
+        let Some(ServerFrame::Response(conflicting)) = conflicting.next().await else {
+            panic!("conflicting interaction")
+        };
+        assert!(conflicting.error.is_some());
 
         let mut saw_text = false;
         loop {
@@ -943,6 +1036,15 @@ mod tests {
             }
         }
         assert!(saw_text);
+        let receipts =
+            crate::entry::cli::request_result(&client, "run.tools", json!({"run_id":owner_run_id}))
+                .await
+                .unwrap();
+        assert_eq!(receipts["receipts"][0]["status"], "terminal");
+        assert_eq!(receipts["receipts"][0]["name"], "danger");
+        assert_eq!(receipts["receipts"][0]["receipt"]["output"], "approved");
+        let artifact = receipts["receipts"][0]["artifact_ref"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "approved");
         let _ = std::fs::remove_file(session_path);
     }
 }

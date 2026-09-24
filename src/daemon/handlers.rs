@@ -23,7 +23,8 @@ use crate::safety::SafetyMode;
 use crate::session::SessionStatus;
 use crate::slash::{SlashAction, SlashParse, SlashRegistry, SlashResponse};
 use crate::storage::{
-    Admission, EventSeq, InteractionId, RunId, RunStatus, RuntimeError, SessionId, StoredEvent,
+    Admission, AdmissionMode, EventSeq, InteractionId, RunId, RunStatus, RuntimeError, SessionId,
+    StoredEvent,
 };
 
 const INVALID_PARAMS: i64 = -32602;
@@ -41,16 +42,41 @@ struct ChatSendParams {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    admission_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ApprovalRespondParams {
+    #[serde(alias = "interaction_id")]
     approval_id: String,
-    approved: bool,
+    #[serde(default)]
+    approved: Option<bool>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    owner_run_id: Option<RunId>,
+    #[serde(default)]
+    revision: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct InteractionReadParams {
+    interaction_id: InteractionId,
 }
 
 #[derive(Deserialize)]
 struct CancelParams {
+    #[serde(default)]
+    request_id: Option<RequestId>,
+    #[serde(default)]
+    run_id: Option<RunId>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubscribeParams {
     request_id: RequestId,
     #[serde(default)]
     session_id: Option<String>,
@@ -60,6 +86,12 @@ struct CancelParams {
 
 #[derive(Deserialize)]
 struct RunReadParams {
+    run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct QueueItemParams {
+    session_id: String,
     run_id: RunId,
 }
 
@@ -196,34 +228,74 @@ impl DaemonState {
                 };
                 send_result(&frames, request.id, result);
             }
-            "approval.respond" => {
+            "approval.respond" | "interaction.respond" | "interaction.reject" => {
+                let rejected = request.method == "interaction.reject";
                 let result = match parse_params::<ApprovalRespondParams>(&request.params) {
-                    Ok(params) => {
-                        match self
-                            .approvals
-                            .respond(&params.approval_id, params.approved)
-                            .await
-                        {
-                            Ok(()) => self
-                                .run_store
-                                .answer_interaction(
-                                    &InteractionId(params.approval_id),
-                                    params.approved,
-                                )
-                                .map(|()| json!({"accepted": true}))
-                                .map_err(|error| (INTERNAL_ERROR, error.to_string())),
-                            Err(error) => Err((INVALID_PARAMS, format!("{error:#}"))),
-                        }
-                    }
+                    Ok(params) => self.resolve_interaction(params, rejected).await,
                     Err(error) => Err((INVALID_PARAMS, error)),
                 };
                 send_result(&frames, request.id, result);
             }
+            "interaction.read" => {
+                let result = parse_params::<InteractionReadParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .read_interaction(&params.interaction_id)
+                            .map(|interaction| json!({"interaction": interaction}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "interaction.list" => {
+                let result = parse_params::<SessionResumeParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .list_interactions(&params.session_id)
+                            .map(|interactions| json!({"interactions": interactions}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
             "agent.cancel" => {
                 let result = match parse_params::<CancelParams>(&request.params) {
+                    Ok(params) => self.cancel(params).await,
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
+                send_result(&frames, request.id, result);
+            }
+            "queue.list" => {
+                let result = parse_params::<SessionResumeParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .queued_messages(&params.session_id)
+                            .map(|items| json!({"items": items}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "queue.read" => {
+                let result = parse_params::<QueueItemParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .queued_message(&params.session_id, &params.run_id)
+                            .map(|item| json!({"item": item}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "queue.remove" => {
+                let result = match parse_params::<QueueItemParams>(&request.params) {
                     Ok(params) => {
-                        self.cancel(&params.request_id, params.session_id.as_deref())
-                            .await
+                        self.cancel(CancelParams {
+                            request_id: None,
+                            run_id: Some(params.run_id),
+                            session_id: Some(params.session_id),
+                        })
+                        .await
                     }
                     Err(error) => Err((INVALID_PARAMS, error)),
                 };
@@ -242,6 +314,24 @@ impl DaemonState {
                                     .ok_or((INVALID_PARAMS, "run 不存在".into()))
                             })
                     });
+                send_result(&frames, request.id, result);
+            }
+            "run.tools" => {
+                let result = parse_params::<RunReadParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .tool_receipts(&params.run_id)
+                            .map(|receipts| json!({"receipts": receipts}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "run.audit" => {
+                let result = match parse_params::<RunReadParams>(&request.params) {
+                    Ok(params) => self.audit_run(&params.run_id).await,
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
                 send_result(&frames, request.id, result);
             }
             "run.events" => {
@@ -296,6 +386,14 @@ impl DaemonState {
         request: JsonRpcRequest,
         frames: mpsc::UnboundedSender<ServerFrame>,
     ) {
+        if self.shutdown.is_cancelled() {
+            send_result(
+                &frames,
+                request.id,
+                Err((REQUEST_CONFLICT, "daemon 正在关闭，停止新准入".into())),
+            );
+            return;
+        }
         let params = match parse_params::<ChatSendParams>(&request.params) {
             Ok(params) if !params.message.trim().is_empty() => params,
             Ok(_) => {
@@ -320,10 +418,23 @@ impl DaemonState {
             }
         };
         let session_id = session.id.clone();
-        let admitted = match self.run_store.admit(
+        let mode = match params.admission_mode.as_deref().unwrap_or("queue") {
+            "queue" => AdmissionMode::Queue,
+            "reject_if_busy" => AdmissionMode::RejectIfBusy,
+            _ => {
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((INVALID_PARAMS, "不支持的 admission_mode".into())),
+                );
+                return;
+            }
+        };
+        let admitted = match self.run_store.admit_with_mode(
             SessionId(session_id.clone()),
             request.id.clone(),
             &params.message,
+            mode,
         ) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -347,20 +458,19 @@ impl DaemonState {
                             json!({"content": run.content, "run_id": run.run_id, "turn_id": run.turn_id}),
                         ),
                     );
-                } else {
+                    return;
+                } else if run.status != RunStatus::Queued {
                     send_result(
                         &frames,
                         request.id,
-                        Err((
-                            REQUEST_CONFLICT,
-                            format!(
-                                "已有相同 request id 的 run {}，状态 {:?}",
-                                run.run_id.0, run.status
-                            ),
-                        )),
+                        Ok(json!({"run_id": run.run_id, "turn_id": run.turn_id,
+                            "status": run.status, "duplicate": true,
+                            "error_code": run.error_code, "error_message": run.error_message})),
                     );
+                    return;
+                } else {
+                    run
                 }
-                return;
             }
         };
         let started_at = Instant::now();
@@ -380,7 +490,9 @@ impl DaemonState {
             send_result(
                 &frames,
                 request.id,
-                Err((REQUEST_CONFLICT, "请求 id 正在执行".to_owned())),
+                Ok(
+                    json!({"run_id": run_record.run_id, "turn_id": run_record.turn_id, "status": "queued_or_running", "duplicate": true}),
+                ),
             );
             return;
         }
@@ -389,14 +501,39 @@ impl DaemonState {
             ActiveRequest::new(cancellation.clone(), run_record.run_id.clone()),
         );
         drop(active);
-        if let Err(error) = self.run_store.mark_running(&run_record.run_id) {
-            self.active.lock().await.remove(&active_key);
-            send_result(
-                &frames,
-                request.id,
-                Err((INTERNAL_ERROR, error.to_string())),
-            );
-            return;
+        self.queue_notify.notify_waiters();
+        loop {
+            let notified = self.queue_notify.notified();
+            if cancellation.is_cancelled() {
+                self.active.lock().await.remove(&active_key);
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((REQUEST_CANCELLED, "请求已取消".into())),
+                );
+                return;
+            }
+            match self.run_store.try_start_queued(&run_record.run_id) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    self.active.lock().await.remove(&active_key);
+                    send_result(
+                        &frames,
+                        request.id,
+                        Err((INTERNAL_ERROR, error.to_string())),
+                    );
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = cancellation.cancelled() => {},
+                _ = self.shutdown.cancelled() => {
+                    self.active.lock().await.remove(&active_key);
+                    return;
+                }
+            }
         }
 
         let (agent_events, mut event_receiver) = mpsc::unbounded_channel();
@@ -407,9 +544,10 @@ impl DaemonState {
             session_id = %session_id,
             request_id = ?request.id,
         );
-        let run = self
-            .approvals
-            .with_session_context(
+        let run = crate::loop_engine::with_tool_audit(
+            self.run_store.clone(),
+            run_record.run_id.clone(),
+            self.approvals.with_session_context(
                 session_id.clone(),
                 request.id.clone(),
                 approval_events,
@@ -426,8 +564,9 @@ impl DaemonState {
                         )
                         .await
                 },
-            )
-            .instrument(turn_span);
+            ),
+        )
+        .instrument(turn_span);
         tokio::pin!(run);
 
         let result = loop {
@@ -484,6 +623,9 @@ impl DaemonState {
             .and_then(|active| active.storage_error.clone());
         let response = match (storage_error, result) {
             (Some(error), _) => Err((INTERNAL_ERROR, format!("持久化事件失败: {error}"))),
+            (None, Ok(_)) if cancellation.is_cancelled() => {
+                Err((REQUEST_CANCELLED, "请求已取消".to_owned()))
+            }
             (None, Ok(content)) => Ok(
                 json!({"content": content, "run_id": run_record.run_id, "turn_id": run_record.turn_id}),
             ),
@@ -511,20 +653,30 @@ impl DaemonState {
             .as_ref()
             .err()
             .map(|(code, message)| (*code, message.as_str()));
-        if let Err(storage_error) =
-            self.run_store
-                .finish(&run_record.run_id, terminal_status, content, error)
-        {
-            tracing::error!(run_id = %run_record.run_id.0, error = %storage_error, "提交 run 终态失败");
-            send_result(
-                &frames,
-                request.id,
-                Err((INTERNAL_ERROR, format!("持久化终态失败: {storage_error}"))),
-            );
-            self.active.lock().await.remove(&active_key);
-            return;
-        }
-        if let Some(content) = content {
+        let committed = match self.run_store.finish(
+            &run_record.run_id,
+            terminal_status,
+            content,
+            error,
+        ) {
+            Ok(committed) => committed,
+            Err(storage_error) => {
+                tracing::error!(run_id = %run_record.run_id.0, error = %storage_error, "提交 run 终态失败");
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((INTERNAL_ERROR, format!("持久化终态失败: {storage_error}"))),
+                );
+                self.active.lock().await.remove(&active_key);
+                return;
+            }
+        };
+        let response = if committed.status == RunStatus::UnknownAfterRestart {
+            Err((-32002, "工具执行结果未知，禁止自动重放".to_owned()))
+        } else {
+            response
+        };
+        if let Some(content) = committed.content.as_deref() {
             self.publish_committed_completion(&frames, &active_key, content)
                 .await;
         }
@@ -553,6 +705,7 @@ impl DaemonState {
         )
         .await;
         self.active.lock().await.remove(&active_key);
+        self.queue_notify.notify_waiters();
     }
 
     async fn session_runtime(
@@ -569,10 +722,21 @@ impl DaemonState {
         if let Some(runtime) = self.sessions.lock().await.get(&session_id).cloned() {
             return Ok(runtime);
         }
-        let store = self
-            .session
-            .open_session(&session_id)
-            .map_err(|error| (INVALID_PARAMS, format!("{error:#}")))?;
+        let store = match self.session.open_session(&session_id) {
+            Ok(store) => store,
+            Err(open_error) => {
+                if !self
+                    .run_store
+                    .session_exists(&session_id)
+                    .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+                {
+                    return Err((INVALID_PARAMS, format!("{open_error:#}")));
+                }
+                self.session
+                    .open_known_session(&session_id)
+                    .map_err(|error| (INVALID_PARAMS, format!("{error:#}")))?
+            }
+        };
         let store = Arc::new(store);
         let history = store
             .load()
@@ -1420,26 +1584,39 @@ impl DaemonState {
         request: JsonRpcRequest,
         frames: mpsc::UnboundedSender<ServerFrame>,
     ) {
-        let params = match parse_params::<CancelParams>(&request.params) {
+        let params = match parse_params::<SubscribeParams>(&request.params) {
             Ok(params) => params,
             Err(error) => {
                 send_result(&frames, request.id, Err((INVALID_PARAMS, error)));
                 return;
             }
         };
-        let active_match = self
+        let matches = self
             .active
             .lock()
             .await
             .iter()
-            .find(|(key, _)| {
+            .filter(|(key, _)| {
                 key.request_id == params.request_id
                     && params
                         .session_id
                         .as_deref()
                         .is_none_or(|id| key.session_id == id)
             })
-            .map(|(key, active)| (key.clone(), active.run_id.clone(), active.subscribe().1));
+            .map(|(key, active)| (key.clone(), active.run_id.clone(), active.subscribe().1))
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            send_result(
+                &frames,
+                request.id,
+                Err((
+                    REQUEST_CONFLICT,
+                    "request_id 跨 session 不唯一；请指定 session_id".into(),
+                )),
+            );
+            return;
+        }
+        let active_match = matches.into_iter().next();
         let run = if let Some((_, run_id, _)) = &active_match {
             self.run_store.read_run(run_id)
         } else if let Some(session_id) = params.session_id.as_deref() {
@@ -1488,17 +1665,14 @@ impl DaemonState {
             }
         };
         if events.len() == 1000 && events.last().is_some_and(|event| event.seq < run.last_seq) {
-            send_result(
-                &frames,
+            let next = events.last().map_or(cursor, |event| event.seq);
+            let _ = frames.send(ServerFrame::Response(JsonRpcResponse::failure_data(
                 request.id,
-                Err((
-                    REQUEST_CONFLICT,
-                    format!(
-                        "事件回放超过单次上限；请从 seq {} 继续读取 run.events",
-                        events.last().map_or(cursor.0, |event| event.seq.0)
-                    ),
-                )),
-            );
+                REQUEST_CONFLICT,
+                "resync_required",
+                json!({"kind": "resync_required", "snapshot": run,
+                    "last_seq": run.last_seq, "cursor": next, "next_method": "run.events"}),
+            )));
             return;
         }
         for event in events {
@@ -1568,14 +1742,15 @@ impl DaemonState {
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    send_result(
-                        &frames,
+                    let snapshot = self.run_store.read_run(&run.run_id).ok().flatten();
+                    let last_seq = snapshot.as_ref().map(|item| item.last_seq);
+                    let _ = frames.send(ServerFrame::Response(JsonRpcResponse::failure_data(
                         request.id,
-                        Err((
-                            REQUEST_CONFLICT,
-                            format!("订阅事件出现缺口；请从 seq {} 调用 run.events", cursor.0),
-                        )),
-                    );
+                        REQUEST_CONFLICT,
+                        "resync_required",
+                        json!({"kind": "resync_required", "snapshot": snapshot,
+                            "last_seq": last_seq, "cursor": cursor, "next_method": "run.events"}),
+                    )));
                     return;
                 }
             }
@@ -1617,6 +1792,13 @@ impl DaemonState {
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .unwrap_or_default();
+            if *kind == EventKind::ApprovalRequired
+                && let Some(id) = data["approval"]["id"].as_str()
+            {
+                data["interaction"] = json!({"interaction_id": id, "session_id": active_key.session_id,
+                    "owner_run_id": run_id, "kind": "approval", "status": "pending", "revision": 0,
+                    "payload": data["approval"]});
+            }
             match self.run_store.append_event(run_id, &name, data) {
                 Ok(next_seq) => {
                     *field_id = Some(run_id.clone());
@@ -1671,42 +1853,192 @@ impl DaemonState {
         let _ = frames.send(update.to_frame(active_key.request_id.clone()));
     }
 
-    async fn cancel(
+    async fn resolve_interaction(
         &self,
-        request_id: &RequestId,
-        session_id: Option<&str>,
+        params: ApprovalRespondParams,
+        rejected: bool,
     ) -> Result<Value, (i64, String)> {
-        let matching_key = self
-            .active
-            .lock()
+        let approved = if rejected {
+            false
+        } else {
+            params
+                .approved
+                .ok_or((INVALID_PARAMS, "缺少 approved".into()))?
+        };
+        let _guard = self.control_lock.lock().await;
+        let id = InteractionId(params.approval_id);
+        let current = self
+            .run_store
+            .read_interaction(&id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .ok_or((INVALID_PARAMS, "interaction 不存在".into()))?;
+        if params
+            .session_id
+            .as_deref()
+            .is_some_and(|session| session != current.session_id.0)
+            || params
+                .owner_run_id
+                .as_ref()
+                .is_some_and(|run| run != &current.owner_run_id)
+        {
+            return Err((REQUEST_CONFLICT, "interaction owner 不匹配".into()));
+        }
+        let revision = params.revision.unwrap_or(current.revision);
+        let claim = || {
+            self.run_store.claim_interaction(
+                &id,
+                &current.session_id,
+                &current.owner_run_id,
+                revision,
+                approved,
+            )
+        };
+        let record = if current.status == "pending" {
+            match self.approvals.respond_claimed(&id.0, approved, claim).await {
+                Ok(record) => record,
+                Err(error) => {
+                    if let Ok(Some(after)) = self.run_store.read_interaction(&id)
+                        && matches!(after.status.as_str(), "answered" | "rejected")
+                    {
+                        let _ = self.run_store.finish(
+                            &after.owner_run_id,
+                            RunStatus::UnknownAfterRestart,
+                            None,
+                            Some((-32002, "审批执行体已消失")),
+                        );
+                    }
+                    return Err((REQUEST_CONFLICT, format!("{error:#}")));
+                }
+            }
+        } else {
+            claim().map_err(|error| (REQUEST_CONFLICT, error.to_string()))?
+        };
+        Ok(json!({"accepted": true, "interaction": record}))
+    }
+
+    async fn audit_run(&self, run_id: &RunId) -> Result<Value, (i64, String)> {
+        let run = self
+            .run_store
+            .read_run(run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .ok_or((INVALID_PARAMS, "run 不存在".into()))?;
+        let store = self
+            .session
+            .open_known_session(&run.session_id.0)
+            .map_err(|error| (INTERNAL_ERROR, format!("JSONL 读取失败: {error:#}")))?;
+        let messages = store
+            .load()
             .await
-            .keys()
-            .find(|key| {
-                &key.request_id == request_id
-                    && session_id.is_none_or(|session_id| key.session_id == session_id)
+            .map_err(|error| (INTERNAL_ERROR, format!("JSONL 读取失败: {error:#}")))?;
+        let matching_assistant = run.content.as_ref().is_some_and(|content| {
+            messages.iter().any(|message| {
+                message.role == crate::provider::Role::Assistant
+                    && message.content.as_ref() == Some(content)
             })
-            .cloned();
-        let Some(matching_key) = matching_key else {
-            return Ok(json!({"cancelled": false, "reason": "请求未在执行"}));
+        });
+        let receipts = self
+            .run_store
+            .tool_receipts(run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+        let incomplete = receipts
+            .iter()
+            .filter(|receipt| receipt.status != "terminal")
+            .count();
+        let diagnostic = if run.status == RunStatus::Completed && !matching_assistant {
+            "jsonl_missing_or_diverged"
+        } else if run.status == RunStatus::UnknownAfterRestart {
+            "control_state_unknown"
+        } else {
+            "no_detected_divergence"
+        };
+        Ok(
+            json!({"run_id": run_id, "control_status": run.status, "last_seq": run.last_seq,
+            "diagnostic": diagnostic, "jsonl_matching_assistant": matching_assistant,
+            "incomplete_tool_receipts": incomplete, "jsonl_is_authoritative": false}),
+        )
+    }
+
+    async fn cancel(&self, params: CancelParams) -> Result<Value, (i64, String)> {
+        let _guard = self.control_lock.lock().await;
+        let mut run = if let Some(run_id) = params.run_id {
+            let session_id = params
+                .session_id
+                .ok_or((INVALID_PARAMS, "exact cancel 需要 session_id".into()))?;
+            let run = self
+                .run_store
+                .read_run(&run_id)
+                .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+                .ok_or((INVALID_PARAMS, "run 不存在".into()))?;
+            if run.session_id.0 != session_id {
+                return Err((REQUEST_CONFLICT, "run 不属于指定 session".into()));
+            }
+            run
+        } else if let Some(request_id) = params.request_id {
+            let result = if let Some(session_id) = params.session_id {
+                self.run_store.find_request(&session_id, &request_id)
+            } else {
+                self.run_store.find_request_unique(&request_id)
+            };
+            match result.map_err(|error| (REQUEST_CONFLICT, error.to_string()))? {
+                Some(run) => run,
+                None => return Ok(json!({"cancelled": false, "reason": "请求不存在"})),
+            }
+        } else {
+            return Err((INVALID_PARAMS, "需要 run_id 或 request_id".into()));
+        };
+        if run.status == RunStatus::Queued {
+            let removed = self
+                .run_store
+                .remove_queued(&run.run_id)
+                .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+            if removed {
+                let key = ActiveKey {
+                    session_id: run.session_id.0.clone(),
+                    request_id: run.request_id.clone(),
+                };
+                if let Some(active) = self.active.lock().await.get_mut(&key) {
+                    active.publish(ActiveRequestUpdate::Terminal(Err((
+                        REQUEST_CANCELLED,
+                        "请求已取消".into(),
+                    ))));
+                    active.cancellation.cancel();
+                }
+                self.queue_notify.notify_waiters();
+            }
+            if removed {
+                return Ok(json!({"cancelled": true, "run_id": run.run_id, "status": "queued"}));
+            }
+            run = self
+                .run_store
+                .read_run(&run.run_id)
+                .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+                .ok_or((INVALID_PARAMS, "run 不存在".into()))?;
+        }
+        if !matches!(
+            run.status,
+            RunStatus::Running | RunStatus::WaitingInteraction
+        ) {
+            return Ok(json!({"cancelled": false, "run_id": run.run_id, "status": run.status}));
+        }
+        let key = ActiveKey {
+            session_id: run.session_id.0.clone(),
+            request_id: run.request_id.clone(),
         };
         let token = self
             .active
             .lock()
             .await
-            .get(&matching_key)
+            .get(&key)
+            .filter(|active| active.run_id == run.run_id)
             .map(|active| active.cancellation.clone());
         let Some(token) = token else {
-            return Ok(json!({"cancelled": false, "reason": "请求未在执行"}));
+            return Ok(json!({"cancelled": false, "reason": "执行体已消失", "run_id": run.run_id}));
         };
         token.cancel();
-        if let Some(session_id) = session_id {
-            self.approvals
-                .cancel_request_in_session(session_id, request_id)
-                .await;
-        } else {
-            self.approvals.cancel_request(request_id).await;
-        }
-        Ok(json!({"cancelled": true}))
+        self.approvals
+            .cancel_request_in_session(&run.session_id.0, &run.request_id)
+            .await;
+        Ok(json!({"cancelled": true, "run_id": run.run_id, "status": "running"}))
     }
 }
 

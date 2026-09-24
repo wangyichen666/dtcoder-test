@@ -7,17 +7,35 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::context::ContextManager;
 use crate::provider::{Message, Provider, ProviderEvent, Response, Role, ToolCall};
 use crate::session::{SessionStore, SessionTraceRecord};
-use crate::storage::RuntimeError;
+use crate::storage::{RunId, RunStore, RuntimeError};
 use crate::tool_calls::ToolCallAssembler;
 use crate::tools::{ToolCancellation, ToolOutput, ToolRegistry};
 
 pub const DEFAULT_PROGRESS_CHECKPOINT_ROUNDS: usize = 50;
+tokio::task_local! { static TOOL_AUDIT: ToolAuditContext; }
+
+#[derive(Clone)]
+struct ToolAuditContext {
+    store: Arc<RunStore>,
+    run_id: RunId,
+}
+
+pub async fn with_tool_audit<F: std::future::Future>(
+    store: Arc<RunStore>,
+    run_id: RunId,
+    future: F,
+) -> F::Output {
+    TOOL_AUDIT
+        .scope(ToolAuditContext { store, run_id }, future)
+        .await
+}
 pub const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
 const REPETITION_THRESHOLD: usize = 3;
 const REPETITION_ABORT_THRESHOLD: usize = 10;
@@ -342,6 +360,27 @@ impl LoopEngine {
                         }
                         continue;
                     }
+                    let audit = TOOL_AUDIT.try_with(Clone::clone).ok();
+                    if let Some(audit) = &audit {
+                        let prepared = calls
+                            .iter()
+                            .map(|call| {
+                                let effect = if self.tools.is_read_only(&call.name) {
+                                    "read"
+                                } else {
+                                    "external_side_effect"
+                                };
+                                let digest = format!(
+                                    "{:x}",
+                                    Sha256::digest(call.arguments.to_string().as_bytes())
+                                );
+                                (call.clone(), effect.to_owned(), digest, false)
+                            })
+                            .collect::<Vec<_>>();
+                        audit
+                            .store
+                            .prepare_tool_batch(&audit.run_id, round, &prepared)?;
+                    }
                     self.record(
                         history,
                         Message::assistant_tool_calls_with_thinking(calls.clone(), output.thinking),
@@ -356,7 +395,7 @@ impl LoopEngine {
                     );
                     tokio::pin!(execute);
                     let results = tokio::select! {
-                        results = &mut execute => results,
+                        results = &mut execute => results?,
                         _ = cancellation.cancelled() => return Err(RuntimeError::Cancelled.into()),
                     };
                     let round_failures = results.iter().filter(|result| result.failed).count();
@@ -370,6 +409,9 @@ impl LoopEngine {
                         self.record(history, result.message).await?;
                         transient_messages.extend(result.transient_messages);
                         fingerprints.push(result.fingerprint);
+                    }
+                    if let Some(audit) = &audit {
+                        audit.store.finish_tool_batch(&audit.run_id, round)?;
                     }
                     let repeat_count = repeat_detector.observe(fingerprints);
                     if repeat_count == REPETITION_THRESHOLD {
@@ -620,7 +662,7 @@ impl LoopEngine {
         cancellation: &CancellationToken,
         round: usize,
         trace_request_id: Option<&str>,
-    ) -> Vec<ToolExecution> {
+    ) -> Result<Vec<ToolExecution>> {
         let mut results = Vec::with_capacity(calls.len());
         let mut cursor = 0;
         while cursor < calls.len() {
@@ -638,8 +680,10 @@ impl LoopEngine {
                         }
                     })
                     .buffered(8)
-                    .collect::<Vec<ToolExecution>>()
-                    .await;
+                    .collect::<Vec<Result<ToolExecution>>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
                 results.extend(batch);
                 cursor = end;
             } else {
@@ -651,12 +695,12 @@ impl LoopEngine {
                         round,
                         trace_request_id,
                     )
-                    .await,
+                    .await?,
                 );
                 cursor += 1;
             }
         }
-        results
+        Ok(results)
     }
 
     async fn execute_one(
@@ -666,8 +710,12 @@ impl LoopEngine {
         cancellation: &CancellationToken,
         round: usize,
         trace_request_id: Option<&str>,
-    ) -> ToolExecution {
+    ) -> Result<ToolExecution> {
         let started_at = Instant::now();
+        let audit = TOOL_AUDIT.try_with(Clone::clone).ok();
+        if let Some(audit) = &audit {
+            audit.store.start_tool(&audit.run_id, round, &call.id)?;
+        }
         debug!(
             tool_call_id = %call.id,
             tool = %call.name,
@@ -710,6 +758,16 @@ impl LoopEngine {
                 )
             }
         };
+        if let Some(audit) = &audit {
+            let artifact_ref = audit.store.store_tool_output(&result.content)?;
+            let output_preview = result.content.chars().take(4096).collect::<String>();
+            audit.store.finish_tool(&audit.run_id, round, &call.id,
+                if failed { "tool_error" } else { "success" }, Some(&artifact_ref),
+                &serde_json::json!({"success": !failed, "output": output_preview, "output_truncated": result.content.chars().count() > 4096,
+                    "output_sha256": format!("{:x}", Sha256::digest(result.content.as_bytes())),
+                    "error": error_message, "output_bytes": result.content.len(),
+                    "duration_ms": started_at.elapsed().as_millis() as u64}))?;
+        }
         emit(
             &events,
             AgentEvent::ToolFinished {
@@ -750,13 +808,13 @@ impl LoopEngine {
             arguments: fingerprint_json(&call.arguments),
             result: fingerprint_text(&result.content),
         };
-        ToolExecution {
+        Ok(ToolExecution {
             message: Message::tool_result(call, result.content),
             transient_messages: result.transient_messages,
             fingerprint,
             failed,
             error: error_message,
-        }
+        })
     }
 }
 

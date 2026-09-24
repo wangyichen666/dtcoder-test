@@ -10,6 +10,7 @@ use super::lifecycle::RuntimePaths;
 use crate::config::ConfigStore;
 use crate::context::{ContextConfig, ContextManager};
 use crate::cron::{AgentCronRunner, CronManager, CronStore, UnattendedApproval};
+use crate::daemon::protocol::JsonRpcRequest;
 use crate::loop_engine::LoopEngine;
 use crate::mcp::McpManager;
 use crate::memory::{MemoryStore, RecallMemoryTool, RememberTool};
@@ -117,6 +118,25 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
             run_store,
         ),
     );
+    for queued in state.run_store.recoverable_queued()? {
+        let message = state
+            .run_store
+            .queued_message(&queued.session_id.0, &queued.run_id)?
+            .ok_or_else(|| anyhow::anyhow!("queued run {} 缺少队列项", queued.run_id.0))?
+            .message;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let (frames, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+            let request = JsonRpcRequest::new(
+                queued.request_id,
+                "chat.send",
+                serde_json::json!({"session_id": queued.session_id.0, "message": message}),
+            );
+            state.handle_request(request, frames).await;
+            let _ = drain.await;
+        });
+    }
     cron.start(state.shutdown.clone()).await;
     Ok(state)
 }

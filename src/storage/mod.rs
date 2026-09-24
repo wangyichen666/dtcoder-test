@@ -1,14 +1,18 @@
 //! SQLite control facts. JSONL remains a readable transcript, not the run authority.
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::daemon::protocol::RequestId;
+use crate::provider::ToolCall;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -113,14 +117,62 @@ pub struct StoredEvent {
     pub data: Value,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolReceipt {
+    pub run_id: RunId,
+    pub round: i64,
+    pub call_id: String,
+    pub name: String,
+    pub status: String,
+    pub effect: String,
+    pub argument_digest: String,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub outcome: Option<String>,
+    pub artifact_ref: Option<String>,
+    pub safe_to_replay: bool,
+    pub receipt: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QueuedMessage {
+    pub id: i64,
+    pub position: i64,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub message: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InteractionRecord {
+    pub interaction_id: InteractionId,
+    pub session_id: SessionId,
+    pub owner_run_id: RunId,
+    pub kind: String,
+    pub status: String,
+    pub revision: i64,
+    pub prompt: String,
+    pub payload: Value,
+    pub response: Option<Value>,
+}
+
 pub enum Admission {
     New(RunRecord),
     Existing(RunRecord),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionMode {
+    Queue,
+    RejectIfBusy,
+}
+
 pub struct RunStore {
     connection: Mutex<Connection>,
+    artifact_dir: PathBuf,
 }
+static NEXT_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 impl RunStore {
     pub fn open(path: &Path) -> Result<Self, RuntimeError> {
         if let Some(parent) = path.parent() {
@@ -139,7 +191,7 @@ impl RunStore {
             [],
             |row| row.get(0),
         )?;
-        if version > 1 {
+        if version > 3 {
             return Err(RuntimeError::Protocol(format!(
                 "SQLite schema 版本 {version} 比当前程序支持的版本新"
             )));
@@ -169,16 +221,65 @@ impl RunStore {
                 INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, CAST(strftime('%s','now') AS INTEGER) * 1000);
                 COMMIT;")?;
         }
+        if version < 2 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                ALTER TABLE tool_executions RENAME TO tool_executions_v1;
+                CREATE TABLE tool_executions(
+                    id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+                    round INTEGER NOT NULL, call_id TEXT NOT NULL, name TEXT NOT NULL,
+                    status TEXT NOT NULL, effect TEXT NOT NULL, argument_digest TEXT NOT NULL,
+                    prepared_at_ms INTEGER NOT NULL, started_at_ms INTEGER, finished_at_ms INTEGER,
+                    outcome TEXT, artifact_ref TEXT, safe_to_replay INTEGER NOT NULL DEFAULT 0,
+                    receipt_json TEXT, UNIQUE(run_id, round, call_id));
+                INSERT INTO tool_executions(run_id, round, call_id, name, status, effect,
+                    argument_digest, prepared_at_ms, receipt_json)
+                    SELECT run_id, 0, call_id, 'unknown', status, 'unknown', '',
+                    CAST(strftime('%s','now') AS INTEGER) * 1000, receipt_json
+                    FROM tool_executions_v1;
+                DROP TABLE tool_executions_v1;
+                CREATE INDEX tool_executions_run ON tool_executions(run_id, round, id);
+                DELETE FROM queued_messages WHERE run_id IS NOT NULL AND id NOT IN
+                    (SELECT MIN(id) FROM queued_messages WHERE run_id IS NOT NULL GROUP BY run_id);
+                CREATE UNIQUE INDEX queued_messages_run ON queued_messages(run_id);
+                CREATE INDEX queued_messages_session_status ON queued_messages(session_id, status, id);
+                INSERT OR IGNORE INTO queued_messages(session_id, run_id, message, status)
+                    SELECT session_id, id, input, 'queued' FROM runs WHERE status='queued';
+                ALTER TABLE interactions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+                INSERT INTO schema_migrations(version, applied_at_ms)
+                    VALUES (2, CAST(strftime('%s','now') AS INTEGER) * 1000);
+                COMMIT;")?;
+        }
+        if version < 3 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                ALTER TABLE interactions ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';
+                INSERT INTO schema_migrations(version, applied_at_ms)
+                    VALUES (3, CAST(strftime('%s','now') AS INTEGER) * 1000);
+                COMMIT;",
+            )?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
+            artifact_dir: path.with_file_name("tool-artifacts"),
         })
     }
 
+    #[cfg(test)]
     pub fn admit(
         &self,
         session_id: SessionId,
         request_id: RequestId,
         input: &str,
+    ) -> Result<Admission, RuntimeError> {
+        self.admit_with_mode(session_id, request_id, input, AdmissionMode::Queue)
+    }
+
+    pub fn admit_with_mode(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        input: &str,
+        mode: AdmissionMode,
     ) -> Result<Admission, RuntimeError> {
         let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
         let transaction = connection.transaction()?;
@@ -206,6 +307,12 @@ impl RunStore {
             transaction.commit()?;
             return Ok(Admission::Existing(run));
         }
+        if mode == AdmissionMode::RejectIfBusy {
+            let busy: i64 = transaction.query_row("SELECT count(*) FROM runs WHERE session_id=?1 AND status IN ('queued','running','waiting_interaction')", params![session_id.0], |row| row.get(0))?;
+            if busy != 0 {
+                return Err(RuntimeError::Protocol("session 忙碌".into()));
+            }
+        }
         let now = now_ms();
         transaction.execute(
             "INSERT OR IGNORE INTO sessions(id, created_at_ms) VALUES (?1, ?2)",
@@ -231,11 +338,301 @@ impl RunStore {
             "user_message",
             &serde_json::json!({"content": input}),
         )?;
+        transaction.execute("INSERT INTO queued_messages(session_id, run_id, message, status) VALUES (?1, ?2, ?3, 'queued')", params![session_id.0, run_id.0, input])?;
         let run = read_run_in(&transaction, &run_id.0)?.expect("inserted run");
         transaction.commit()?;
         Ok(Admission::New(run))
     }
 
+    pub fn try_start_queued(&self, run_id: &RunId) -> Result<bool, RuntimeError> {
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let candidate: Option<String> = transaction
+            .query_row(
+                "SELECT q.run_id FROM queued_messages q
+            WHERE q.status='queued' AND q.session_id=(SELECT session_id FROM runs WHERE id=?1)
+            ORDER BY q.id LIMIT 1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if candidate.as_deref() != Some(&run_id.0) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let busy: i64 = transaction.query_row("SELECT count(*) FROM runs WHERE session_id=(SELECT session_id FROM runs WHERE id=?1) AND status IN ('running','waiting_interaction')", params![run_id.0], |row| row.get(0))?;
+        if busy != 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE runs SET status='running', updated_at_ms=?2 WHERE id=?1 AND status='queued'",
+            params![run_id.0, now_ms()],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE turns SET status='running' WHERE run_id=?1",
+                params![run_id.0],
+            )?;
+            transaction.execute(
+                "UPDATE queued_messages SET status='running' WHERE run_id=?1",
+                params![run_id.0],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn queued_messages(&self, session_id: &str) -> Result<Vec<QueuedMessage>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let mut statement = connection.prepare("SELECT id, run_id, message, status FROM queued_messages WHERE session_id=?1 AND status='queued' ORDER BY id")?;
+        let rows = statement.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.enumerate()
+            .map(|(index, row)| {
+                let (id, run_id, message, status) = row?;
+                Ok(QueuedMessage {
+                    id,
+                    position: index as i64 + 1,
+                    session_id: SessionId(session_id.to_owned()),
+                    run_id: RunId(run_id),
+                    message,
+                    status,
+                })
+            })
+            .collect()
+    }
+
+    pub fn queued_message(
+        &self,
+        session_id: &str,
+        run_id: &RunId,
+    ) -> Result<Option<QueuedMessage>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        connection.query_row("SELECT id, message, status FROM queued_messages WHERE session_id=?1 AND run_id=?2",
+            params![session_id, run_id.0], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .optional()?.map(|(id, message, status)| {
+                let position = if status == "queued" {
+                    connection.query_row("SELECT count(*) FROM queued_messages WHERE session_id=?1 AND status='queued' AND id<=?2", params![session_id, id], |row| row.get(0))?
+                } else { 0 };
+                Ok(QueuedMessage { id, position, session_id: SessionId(session_id.into()), run_id: run_id.clone(), message, status })
+            }).transpose()
+    }
+
+    pub fn recoverable_queued(&self) -> Result<Vec<RunRecord>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let mut statement = connection
+            .prepare("SELECT id FROM runs WHERE status='queued' ORDER BY created_at_ms, rowid")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| {
+                read_run_in(&connection, id)?
+                    .ok_or_else(|| RuntimeError::Protocol("queued run 消失".into()))
+            })
+            .collect()
+    }
+
+    pub fn session_exists(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id=?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn remove_queued(&self, run_id: &RunId) -> Result<bool, RuntimeError> {
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE runs SET status='cancelled', updated_at_ms=?2 WHERE id=?1 AND status='queued'",
+            params![run_id.0, now_ms()],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE turns SET status='cancelled' WHERE run_id=?1",
+                params![run_id.0],
+            )?;
+            transaction.execute(
+                "UPDATE queued_messages SET status='cancelled' WHERE run_id=?1 AND status='queued'",
+                params![run_id.0],
+            )?;
+            insert_event(
+                &transaction,
+                run_id,
+                "terminal",
+                &serde_json::json!({"status": RunStatus::Cancelled}),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn prepare_tool_batch(
+        &self,
+        run_id: &RunId,
+        round: usize,
+        calls: &[(ToolCall, String, String, bool)],
+    ) -> Result<(), RuntimeError> {
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let status: String = transaction.query_row(
+            "SELECT status FROM runs WHERE id=?1",
+            params![run_id.0],
+            |row| row.get(0),
+        )?;
+        if status != "running" {
+            return Err(RuntimeError::Protocol("run 不在执行状态".into()));
+        }
+        for (call, effect, digest, replay) in calls {
+            transaction.execute("INSERT INTO tool_executions(run_id, round, call_id, name, status, effect, argument_digest, prepared_at_ms, safe_to_replay)
+                VALUES (?1, ?2, ?3, ?4, 'prepared', ?5, ?6, ?7, ?8)",
+                params![run_id.0, round as i64, call.id, call.name, effect, digest, now_ms(), replay])?;
+        }
+        insert_event(
+            &transaction,
+            run_id,
+            "tool_batch_prepared",
+            &serde_json::json!({"round": round, "calls": calls.iter().map(|(call, _, _, _)| &call.id).collect::<Vec<_>>()}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn start_tool(
+        &self,
+        run_id: &RunId,
+        round: usize,
+        call_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let changed = self.connection.lock().expect("SQLite mutex poisoned").execute(
+            "UPDATE tool_executions SET status='running', started_at_ms=?4 WHERE run_id=?1 AND round=?2 AND call_id=?3 AND status='prepared'",
+            params![run_id.0, round as i64, call_id, now_ms()])?;
+        if changed != 1 {
+            return Err(RuntimeError::Protocol("工具不是 prepared 状态".into()));
+        }
+        Ok(())
+    }
+
+    pub fn finish_tool(
+        &self,
+        run_id: &RunId,
+        round: usize,
+        call_id: &str,
+        outcome: &str,
+        artifact_ref: Option<&str>,
+        receipt: &Value,
+    ) -> Result<(), RuntimeError> {
+        let changed = self.connection.lock().expect("SQLite mutex poisoned").execute(
+            "UPDATE tool_executions SET status='terminal', finished_at_ms=?4, outcome=?5, artifact_ref=?6, receipt_json=?7
+                WHERE run_id=?1 AND round=?2 AND call_id=?3 AND status='running'",
+            params![run_id.0, round as i64, call_id, now_ms(), outcome, artifact_ref, receipt.to_string()])?;
+        if changed != 1 {
+            return Err(RuntimeError::Protocol("工具不是 running 状态".into()));
+        }
+        Ok(())
+    }
+
+    pub fn store_tool_output(&self, content: &str) -> Result<String, RuntimeError> {
+        std::fs::create_dir_all(&self.artifact_dir)
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let target = self.artifact_dir.join(format!("sha256-{digest}.txt"));
+        if target.exists() {
+            return Ok(target.to_string_lossy().into_owned());
+        }
+        let temporary = self.artifact_dir.join(format!(
+            ".{digest}-{}-{}.tmp",
+            std::process::id(),
+            NEXT_ARTIFACT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&temporary)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &target)?;
+            std::fs::File::open(&self.artifact_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(RuntimeError::Internal(error.to_string()));
+        }
+        Ok(target.to_string_lossy().into_owned())
+    }
+
+    pub fn finish_tool_batch(&self, run_id: &RunId, round: usize) -> Result<(), RuntimeError> {
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let incomplete: i64 = transaction.query_row("SELECT count(*) FROM tool_executions WHERE run_id=?1 AND round=?2 AND status!='terminal'", params![run_id.0, round as i64], |row| row.get(0))?;
+        if incomplete != 0 {
+            return Err(RuntimeError::Protocol("工具批次尚未全部完成".into()));
+        }
+        insert_event(
+            &transaction,
+            run_id,
+            "tool_batch_completed",
+            &serde_json::json!({"round": round}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn tool_receipts(&self, run_id: &RunId) -> Result<Vec<ToolReceipt>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let mut statement = connection.prepare("SELECT round, call_id, name, status, effect, argument_digest, started_at_ms, finished_at_ms, outcome, artifact_ref, safe_to_replay, receipt_json FROM tool_executions WHERE run_id=?1 ORDER BY round, id")?;
+        let rows = statement.query_map(params![run_id.0], |row| {
+            Ok((
+                ToolReceipt {
+                    run_id: run_id.clone(),
+                    round: row.get(0)?,
+                    call_id: row.get(1)?,
+                    name: row.get(2)?,
+                    status: row.get(3)?,
+                    effect: row.get(4)?,
+                    argument_digest: row.get(5)?,
+                    started_at_ms: row.get(6)?,
+                    finished_at_ms: row.get(7)?,
+                    outcome: row.get(8)?,
+                    artifact_ref: row.get(9)?,
+                    safe_to_replay: row.get(10)?,
+                    receipt: None,
+                },
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut receipt, json) = row?;
+            receipt.receipt = json
+                .map(|json| {
+                    serde_json::from_str(&json)
+                        .map_err(|error| RuntimeError::Protocol(error.to_string()))
+                })
+                .transpose()?;
+            Ok(receipt)
+        })
+        .collect()
+    }
+
+    #[cfg(test)]
     pub fn mark_running(&self, run_id: &RunId) -> Result<(), RuntimeError> {
         let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
         let transaction = connection.transaction()?;
@@ -267,7 +664,7 @@ impl RunStore {
                 .as_str()
                 .ok_or_else(|| RuntimeError::Protocol("approval id 缺失".into()))?;
             let prompt = approval["prompt"].as_str().unwrap_or_default();
-            transaction.execute("INSERT INTO interactions(id, run_id, kind, status, prompt) VALUES (?1, ?2, 'approval', 'pending', ?3)", params![id, run_id.0, prompt])?;
+            transaction.execute("INSERT INTO interactions(id, run_id, kind, status, prompt, payload_json) VALUES (?1, ?2, 'approval', 'pending', ?3, ?4)", params![id, run_id.0, prompt, approval.to_string()])?;
             transaction.execute(
                 "UPDATE runs SET status='waiting_interaction' WHERE id=?1",
                 params![run_id.0],
@@ -277,18 +674,92 @@ impl RunStore {
         Ok(seq)
     }
 
-    pub fn answer_interaction(
+    pub fn read_interaction(
         &self,
         id: &InteractionId,
+    ) -> Result<Option<InteractionRecord>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        read_interaction_in(&connection, &id.0)
+    }
+
+    pub fn list_interactions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<InteractionRecord>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let mut statement = connection.prepare("SELECT i.id FROM interactions i JOIN runs r ON r.id=i.run_id WHERE r.session_id=?1 ORDER BY i.rowid")?;
+        let ids = statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| {
+                read_interaction_in(&connection, id)?
+                    .ok_or_else(|| RuntimeError::Protocol("interaction 消失".into()))
+            })
+            .collect()
+    }
+
+    pub fn claim_interaction(
+        &self,
+        id: &InteractionId,
+        session_id: &SessionId,
+        run_id: &RunId,
+        revision: i64,
         approved: bool,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<InteractionRecord, RuntimeError> {
         let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
         let transaction = connection.transaction()?;
-        transaction.execute("UPDATE interactions SET status='answered', response_json=?2 WHERE id=?1 AND status='pending'",
-            params![id.0, serde_json::json!({"approved": approved}).to_string()])?;
-        transaction.execute("UPDATE runs SET status='running' WHERE id IN (SELECT run_id FROM interactions WHERE id=?1) AND status='waiting_interaction'", params![id.0])?;
+        let current = read_interaction_in(&transaction, &id.0)?
+            .ok_or_else(|| RuntimeError::Protocol("interaction 不存在".into()))?;
+        if current.session_id != *session_id || current.owner_run_id != *run_id {
+            return Err(RuntimeError::Protocol("interaction owner 不匹配".into()));
+        }
+        let response = serde_json::json!({"approved": approved});
+        if current.status != "pending" {
+            if matches!(current.status.as_str(), "answered" | "rejected")
+                && current.response == Some(response)
+            {
+                return Ok(current);
+            }
+            return Err(RuntimeError::Protocol(
+                "interaction 已解决或孤立，答案冲突".into(),
+            ));
+        }
+        if current.revision != revision {
+            return Err(RuntimeError::Protocol("interaction revision 冲突".into()));
+        }
+        let status: String = transaction.query_row(
+            "SELECT status FROM runs WHERE id=?1",
+            params![run_id.0],
+            |row| row.get(0),
+        )?;
+        if status != "waiting_interaction" {
+            return Err(RuntimeError::Protocol(
+                "interaction 的 run 已不在等待".into(),
+            ));
+        }
+        transaction.execute("UPDATE interactions SET status=?2, response_json=?3, revision=revision+1 WHERE id=?1 AND status='pending'",
+            params![id.0, if approved {"answered"} else {"rejected"}, response.to_string()])?;
+        let pending: i64 = transaction.query_row(
+            "SELECT count(*) FROM interactions WHERE run_id=?1 AND status='pending'",
+            params![run_id.0],
+            |row| row.get(0),
+        )?;
+        if pending == 0 {
+            transaction.execute(
+                "UPDATE runs SET status='running' WHERE id=?1 AND status='waiting_interaction'",
+                params![run_id.0],
+            )?;
+        }
+        insert_event(
+            &transaction,
+            run_id,
+            "interaction_resolved",
+            &serde_json::json!({"interaction_id": id, "approved": approved, "revision": revision + 1}),
+        )?;
+        let result = read_interaction_in(&transaction, &id.0)?.expect("claimed interaction");
         transaction.commit()?;
-        Ok(())
+        Ok(result)
     }
 
     pub fn finish(
@@ -300,7 +771,10 @@ impl RunStore {
     ) -> Result<RunRecord, RuntimeError> {
         if !matches!(
             status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Completed
+                | RunStatus::Failed
+                | RunStatus::Cancelled
+                | RunStatus::UnknownAfterRestart
         ) {
             return Err(RuntimeError::Protocol("finish 必须写入终态".into()));
         }
@@ -319,6 +793,26 @@ impl RunStore {
             tracing::warn!(run_id = %run_id.0, existing = ?current.status, attempted = ?status, "拒绝冲突的 run 终态");
             return Err(RuntimeError::Protocol(format!("run {} 终态冲突", run_id.0)));
         }
+        let incomplete_tools: i64 = transaction.query_row(
+            "SELECT count(*) FROM tool_executions WHERE run_id=?1 AND status!='terminal'",
+            params![run_id.0],
+            |row| row.get(0),
+        )?;
+        let status = if incomplete_tools > 0 {
+            RunStatus::UnknownAfterRestart
+        } else {
+            status
+        };
+        let content = if status == RunStatus::Completed {
+            content
+        } else {
+            None
+        };
+        let error = if status == RunStatus::UnknownAfterRestart {
+            Some((-32002, "工具执行结果未知，禁止自动重放"))
+        } else {
+            error
+        };
         if let Some(content) = content {
             insert_event(
                 &transaction,
@@ -339,6 +833,11 @@ impl RunStore {
             "UPDATE turns SET status=?2 WHERE run_id=?1",
             params![run_id.0, status.as_str()],
         )?;
+        transaction.execute(
+            "UPDATE queued_messages SET status=?2 WHERE run_id=?1",
+            params![run_id.0, status.as_str()],
+        )?;
+        transaction.execute("UPDATE interactions SET status='orphaned', revision=revision+1 WHERE run_id=?1 AND status='pending'", params![run_id.0])?;
         let result = read_run_in(&transaction, &run_id.0)?.expect("run still exists");
         transaction.commit()?;
         Ok(result)
@@ -367,6 +866,29 @@ impl RunStore {
             )
             .optional()?;
         id.map(|id| read_run_in(&connection, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn find_request_unique(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<RunRecord>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let request_json = serde_json::to_string(request_id)
+            .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
+        let mut statement = connection
+            .prepare("SELECT id FROM runs WHERE request_id_json=?1 ORDER BY rowid LIMIT 2")?;
+        let ids = statement
+            .query_map(params![request_json], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > 1 {
+            return Err(RuntimeError::Protocol(
+                "request_id 跨 session 不唯一；必须提供 session_id + run_id".into(),
+            ));
+        }
+        ids.first()
+            .map(|id| read_run_in(&connection, id))
             .transpose()
             .map(Option::flatten)
     }
@@ -404,9 +926,8 @@ impl RunStore {
         let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
         let transaction = connection.transaction()?;
         let ids = {
-            let mut statement = transaction.prepare(
-                "SELECT id FROM runs WHERE status IN ('queued','running','waiting_interaction')",
-            )?;
+            let mut statement = transaction
+                .prepare("SELECT id FROM runs WHERE status IN ('running','waiting_interaction')")?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -425,6 +946,10 @@ impl RunStore {
             )?;
             transaction.execute(
                 "UPDATE turns SET status='unknown_after_restart' WHERE run_id=?1",
+                params![id],
+            )?;
+            transaction.execute(
+                "UPDATE queued_messages SET status='unknown_after_restart' WHERE run_id=?1",
                 params![id],
             )?;
         }
@@ -484,6 +1009,53 @@ fn read_run_in(connection: &Connection, id: &str) -> Result<Option<RunRecord>, R
         error_code,
         error_message,
     }))
+}
+
+fn read_interaction_in(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<InteractionRecord>, RuntimeError> {
+    let raw = connection
+        .query_row(
+            "SELECT r.session_id, i.run_id, i.kind, i.status, i.revision, i.prompt, i.response_json, i.payload_json
+        FROM interactions i JOIN runs r ON r.id=i.run_id WHERE i.id=?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(
+        |(session_id, run_id, kind, status, revision, prompt, response_json, payload_json)| {
+            Ok(InteractionRecord {
+                interaction_id: InteractionId(id.to_owned()),
+                session_id: SessionId(session_id),
+                owner_run_id: RunId(run_id),
+                kind,
+                status,
+                revision,
+                prompt,
+                payload: serde_json::from_str(&payload_json)
+                    .map_err(|error| RuntimeError::Protocol(error.to_string()))?,
+                response: response_json
+                    .map(|json| {
+                        serde_json::from_str(&json)
+                            .map_err(|error| RuntimeError::Protocol(error.to_string()))
+                    })
+                    .transpose()?,
+            })
+        },
+    )
+    .transpose()
 }
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -597,5 +1169,273 @@ mod tests {
                 .finish(&run.run_id, RunStatus::Completed, Some("late"), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn queue_is_ordered_single_writer_and_survives_restart() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let session = SessionId("shared".into());
+        let Admission::New(first) = store
+            .admit(session.clone(), RequestId::Number(1), "first")
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Admission::New(second) = store
+            .admit(session.clone(), RequestId::Number(2), "second")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(!store.try_start_queued(&second.run_id).unwrap());
+        assert!(store.try_start_queued(&first.run_id).unwrap());
+        assert!(!store.try_start_queued(&second.run_id).unwrap());
+        assert!(
+            store
+                .admit_with_mode(
+                    session.clone(),
+                    RequestId::Number(3),
+                    "third",
+                    AdmissionMode::RejectIfBusy
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.queued_messages(&session.0).unwrap()[0].run_id,
+            second.run_id
+        );
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        assert_eq!(reopened.recover().unwrap(), 1);
+        assert_eq!(
+            reopened.read_run(&first.run_id).unwrap().unwrap().status,
+            RunStatus::UnknownAfterRestart
+        );
+        assert_eq!(
+            reopened.recoverable_queued().unwrap()[0].run_id,
+            second.run_id
+        );
+        assert!(reopened.try_start_queued(&second.run_id).unwrap());
+    }
+
+    #[test]
+    fn tool_receipt_crash_window_is_unknown_and_never_replayed() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(run) = store
+            .admit(SessionId("effects".into()), RequestId::Number(1), "write")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path":"secret"}),
+        };
+        store
+            .prepare_tool_batch(
+                &run.run_id,
+                1,
+                &[(call, "external_side_effect".into(), "digest".into(), false)],
+            )
+            .unwrap();
+        store.start_tool(&run.run_id, 1, "call-1").unwrap();
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        assert_eq!(reopened.recover().unwrap(), 1);
+        let receipts = reopened.tool_receipts(&run.run_id).unwrap();
+        assert_eq!(receipts[0].status, "running");
+        assert!(!receipts[0].safe_to_replay);
+        assert_eq!(
+            reopened.read_run(&run.run_id).unwrap().unwrap().status,
+            RunStatus::UnknownAfterRestart
+        );
+        assert!(reopened.finish_tool_batch(&run.run_id, 1).is_err());
+    }
+
+    #[test]
+    fn prepared_tool_batch_is_atomic_and_cancel_with_incomplete_receipt_is_unknown() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(run) = store
+            .admit(SessionId("batch".into()), RequestId::Number(1), "batch")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        let call = ToolCall {
+            id: "same".into(),
+            name: "exec".into(),
+            arguments: serde_json::json!({}),
+        };
+        let duplicate = vec![
+            (call.clone(), "process".into(), "digest".into(), false),
+            (call.clone(), "process".into(), "digest".into(), false),
+        ];
+        assert!(
+            store
+                .prepare_tool_batch(&run.run_id, 1, &duplicate)
+                .is_err()
+        );
+        assert!(store.tool_receipts(&run.run_id).unwrap().is_empty());
+        store
+            .prepare_tool_batch(&run.run_id, 1, &duplicate[..1])
+            .unwrap();
+        assert_eq!(
+            store.tool_receipts(&run.run_id).unwrap()[0].status,
+            "prepared"
+        );
+        assert!(store.finish_tool_batch(&run.run_id, 1).is_err());
+        let ended = store
+            .finish(
+                &run.run_id,
+                RunStatus::Cancelled,
+                None,
+                Some((-32800, "cancelled")),
+            )
+            .unwrap();
+        assert_eq!(ended.status, RunStatus::UnknownAfterRestart);
+        assert_eq!(ended.error_code, Some(-32002));
+    }
+
+    #[test]
+    fn jsonl_assistant_without_sqlite_terminal_does_not_imply_completion() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(run) = store
+            .admit(SessionId("jsonl".into()), RequestId::Number(1), "hello")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        let transcript = path.with_extension("jsonl");
+        std::fs::write(&transcript, "{\"role\":\"user\",\"content\":\"hello\"}\n{\"role\":\"assistant\",\"content\":\"done\"}\n").unwrap();
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        assert_eq!(reopened.recover().unwrap(), 1);
+        assert_eq!(
+            reopened.read_run(&run.run_id).unwrap().unwrap().status,
+            RunStatus::UnknownAfterRestart
+        );
+        assert!(
+            std::fs::read_to_string(transcript)
+                .unwrap()
+                .contains("done")
+        );
+    }
+
+    #[test]
+    fn interaction_claim_checks_owner_revision_and_idempotency() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(run) = store
+            .admit(SessionId("owner".into()), RequestId::Number(1), "approve")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        let id = InteractionId("approval-1".into());
+        store
+            .append_event(
+                &run.run_id,
+                "approval_required",
+                &serde_json::json!({"approval":{"id":id.0,"prompt":"allow?"}}),
+            )
+            .unwrap();
+        let second = InteractionId("approval-2".into());
+        store
+            .append_event(
+                &run.run_id,
+                "approval_required",
+                &serde_json::json!({"approval":{"id":second.0,"prompt":"also allow?"}}),
+            )
+            .unwrap();
+        assert!(
+            store
+                .claim_interaction(&id, &SessionId("other".into()), &run.run_id, 0, true)
+                .is_err()
+        );
+        assert!(
+            store
+                .claim_interaction(&id, &run.session_id, &run.run_id, 1, true)
+                .is_err()
+        );
+        let answered = store
+            .claim_interaction(&id, &run.session_id, &run.run_id, 0, true)
+            .unwrap();
+        assert_eq!(answered.revision, 1);
+        assert_eq!(
+            store.read_run(&run.run_id).unwrap().unwrap().status,
+            RunStatus::WaitingInteraction
+        );
+        store
+            .claim_interaction(&second, &run.session_id, &run.run_id, 0, false)
+            .unwrap();
+        assert_eq!(
+            store.read_run(&run.run_id).unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            store
+                .claim_interaction(&id, &run.session_id, &run.run_id, 0, true)
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(
+            store
+                .claim_interaction(&id, &run.session_id, &run.run_id, 1, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_database_upgrades_in_place_and_future_version_fails_closed() {
+        let path = path();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);
+            INSERT INTO schema_migrations VALUES (1, 1);
+            CREATE TABLE sessions(id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL);
+            INSERT INTO sessions VALUES ('old-session', 1);
+            CREATE TABLE runs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, request_id_json TEXT NOT NULL,
+                status TEXT NOT NULL, input TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0,
+                content TEXT, error_code INTEGER, error_message TEXT, created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL, UNIQUE(session_id, request_id_json));
+            INSERT INTO runs(id, session_id, request_id_json, status, input, created_at_ms, updated_at_ms)
+                VALUES ('old-run','old-session','1','queued','hello',1,1);
+            CREATE TABLE interactions(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, prompt TEXT NOT NULL, response_json TEXT);
+            CREATE TABLE queued_messages(id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                run_id TEXT, message TEXT NOT NULL, status TEXT NOT NULL);
+            CREATE TABLE tool_executions(id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                status TEXT NOT NULL, receipt_json TEXT, UNIQUE(run_id, call_id));
+            INSERT INTO tool_executions(run_id,call_id,status) VALUES ('old-run','old-call','prepared');
+            CREATE TABLE turns(id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL);
+            INSERT INTO turns VALUES ('old-turn','old-run','queued');
+            CREATE TABLE events(run_id TEXT NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL,
+                data_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, PRIMARY KEY(run_id,seq));").unwrap();
+        drop(connection);
+        let upgraded = RunStore::open(&path).unwrap();
+        assert_eq!(
+            upgraded.queued_messages("old-session").unwrap()[0].run_id.0,
+            "old-run"
+        );
+        assert_eq!(
+            upgraded.tool_receipts(&RunId("old-run".into())).unwrap()[0].call_id,
+            "old-call"
+        );
+        drop(upgraded);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("INSERT INTO schema_migrations VALUES (99, 99)", [])
+            .unwrap();
+        drop(connection);
+        assert!(RunStore::open(&path).is_err());
     }
 }

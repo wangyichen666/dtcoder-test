@@ -48,7 +48,7 @@
 
 TUI 默认继承当前终端主题，也可启用内置 `dark` / `light` 语义色板。它不是简单的日志滚屏：
 
-- 层级化 transcript、Unicode 字素安全编辑（组合字符/emoji）、多行输入、历史草稿和发送队列。
+- 层级化 transcript、Unicode 字素安全编辑（组合字符/emoji）、多行输入、历史草稿和 daemon 持久发送队列投影。
 - 工具调用默认聚合；`Ctrl+T` 锚定最近一条原 Query，在原对话中内联展开详情。
 - 输入 `/` 实时显示内置命令及简介；继续输入可按前缀过滤，`↑/↓` 选择、`Tab` 补全。
 - 多个并发 turn 按真实阶段聚合状态；模型等待、流式输出、工具执行期间持续显示不确定进度动画。
@@ -108,7 +108,7 @@ flowchart TB
 一次请求的核心链路：
 
 1. 任一入口把请求交给 `DaemonClient`，入口本身不创建 Provider 或工具运行时。
-2. daemon 按 session 获取可取消的 turn 锁，追加用户消息并登记活动请求。
+2. daemon 以 SQLite 事务准入消息、登记 run 与队列项；同一 session 的下一条消息等待 writer permit。
 3. 上下文按“稳定前缀 → 历史 → 动态信息”组装，超过水位时进行两级压缩。
 4. Provider 流式返回文本或工具调用，唯一 assembler 严格拼装参数并 fail-closed。
 5. 整批工具先做 JSON Schema 与安全决策，再按只读并行、副作用串行执行。
@@ -252,10 +252,24 @@ Cron：
 - **严格工具装配**：乱序、重复完成、缺失参数或不完整 EOF 会整轮拒绝，不执行半批副作用。
 - **受控长任务**：主任务没有固定 ReAct 轮次上限，每 50 轮检查进度；完全相同调用与结果连续 10 次才按无进展熔断。
 - **失败恢复**：工具失败会回填模型修复；连续 3 次工具失败则终止并返回明确原因。
-- **断线恢复**：daemon 在工作区 `.my-agent/runtime.sqlite3` 中保存 run、turn、事件序号、交互和终态，并保留活动请求的内存通知。`agent.subscribe` 先回放持久事件，再接实时通知；`run.read` / `run.events` 可在重启后查询。旧 JSONL 对话和 trace 保留。
-- **不确定结果**：daemon 重启时，未提交终态的 run 标为 `unknown_after_restart`，不会自动重放可能产生副作用的工作。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
+- **断线恢复**：daemon 在工作区 `.my-agent/runtime.sqlite3` 中保存 run、turn、队列、工具回执、事件序号、交互和终态。`agent.subscribe` 先回放持久事件，再接实时通知；缺口以 `resync_required` 返回 snapshot、`last_seq` 和分页游标。`run.read` / `run.events` 可在重启后查询。旧 JSONL 对话和 trace 保留。
+- **不确定结果**：daemon 重启时，已启动但未确认终态的 run 标为 `unknown_after_restart`，未启动的 queued run 保留并由 daemon 恢复调度。运行中的未知副作用不自动重放。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
+- **工具回执与诊断**：工具批次在执行前写入 prepared，每个调用在执行前转为 running，结束后提交 typed outcome、最多 4096 字符的预览与本地完整输出 artifact 路径。`run.tools` 查看回执；`run.audit` 比较 SQLite 控制终态与 JSONL 可读副本并报告疑似分歧。JSONL 匹配仅用于诊断，不能证明 run 成功。
 - **平滑升级**：ready 标记记录可执行文件内容指纹；重新构建后会优雅停止旧 daemon，再使用新版本启动。
 - **进程清理**：`exec` 默认 300 秒超时；取消或超时会清理整个子进程组。
+
+### 控制面 RPC（JSON-RPC 2.0）
+
+| 方法 | 参数要点 | 结果 |
+|---|---|---|
+| `chat.send` | `message`, `session_id?`, `admission_mode?: "queue" \| "reject_if_busy"` | 完成后返回 `content/run_id/turn_id`；重复排队请求返回同一 `run_id` |
+| `queue.list` / `queue.read` / `queue.remove` | `session_id`；后两者还需 `run_id` | 稳定队列项 ID、位置与状态；remove 只取消指定 queued run |
+| `agent.cancel` | 优先使用 `session_id + run_id`；兼容 `request_id` | 只取消对应 run；无 session 的旧 request ID 若不唯一则冲突 |
+| `interaction.list` / `interaction.read` | `session_id` / `interaction_id` | 返回 owner、kind、status、revision 和类型化 payload |
+| `interaction.respond` / `interaction.reject` | `interaction_id`, `session_id`, `owner_run_id`, `revision`；respond 还需 `approved` | 先持久 claim 再唤醒；相同答案幂等，冲突答案拒绝。旧 `approval.respond` 仍可用 |
+| `run.read` / `run.events` / `run.tools` / `run.audit` | `run_id`；events 可带 `after_seq/limit` | 状态、分页事件、工具回执、一致性诊断 |
+
+新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`steer`、强沙箱、可恢复子 Agent 仍属于后续阶段。
 
 ## 安全边界
 

@@ -144,6 +144,11 @@ async fn chat(
     }
 }
 
+async fn send_and_disconnect(socket: &Path, id: &str, session: &str, message: &str) {
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    stream.write_all(format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"chat.send","params":{"session_id":session,"message":message}})).as_bytes()).await.unwrap();
+}
+
 async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &str) {
     let mut cli = Command::new(env!("CARGO_BIN_EXE_my-agent"))
         .arg("--workspace")
@@ -305,7 +310,11 @@ async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &s
 async fn committed_terminal_survives_real_daemon_restart_and_uncertain_run_is_not_replayed() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let workspace = temp_workspace();
-        let runtime_dir = PathBuf::from(format!("/tmp/ma-runtime-{}", std::process::id()));
+        let runtime_dir = PathBuf::from(format!(
+            "/tmp/ma-runtime-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let (url, server, provider_requests) = mock_ollama().await;
         let (mut child, socket) = daemon(&workspace, &runtime_dir, &url).await;
         let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
@@ -378,4 +387,82 @@ async fn committed_terminal_survives_real_daemon_restart_and_uncertain_run_is_no
     })
     .await
     .expect("restart contract timed out");
+}
+
+#[tokio::test]
+async fn daemon_queue_is_durable_and_exact_cancel_does_not_hit_running_run() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!("/tmp/ma-queue-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let (url, server, provider_requests) = mock_ollama().await;
+        let (mut child, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"].as_str().unwrap().to_owned();
+        let _ = chat(&socket, "first", &session, "finish", true).await;
+        let (running, _) = chat(&socket, "running", &session, "wait", false).await;
+        for _ in 0..100 {
+            if provider_requests.load(Ordering::SeqCst) >= 2 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_and_disconnect(&socket, "queued", &session, "queued input").await;
+        let queued = loop {
+            let listed = rpc(&socket, "list", "queue.list", json!({"session_id":session})).await;
+            if let Some(item) = listed["result"]["items"].as_array().and_then(|items| items.first()) { break item.clone(); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let queued_run = queued["run_id"].as_str().unwrap().to_owned();
+        assert_eq!(queued["position"], 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+        let duplicate = rpc(&socket, "queued", "chat.send", json!({"session_id":session,"message":"queued input"})).await;
+        assert_eq!(duplicate["result"]["run_id"], queued_run);
+        let rejected = rpc(&socket, "reject", "chat.send", json!({"session_id":session,"message":"no","admission_mode":"reject_if_busy"})).await;
+        assert!(rejected.get("error").is_some());
+        let cancelled = rpc(&socket, "cancel", "agent.cancel", json!({"session_id":session,"run_id":queued_run})).await;
+        assert_eq!(cancelled["result"]["cancelled"], true);
+        let read = rpc(&socket, "read", "run.read", json!({"run_id":queued_run})).await;
+        assert_eq!(read["result"]["status"], "cancelled");
+        let active = rpc(&socket, "active", "run.read", json!({"run_id":running})).await;
+        assert_eq!(active["result"]["status"], "running");
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+        let port_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = port_listener.local_addr().unwrap().port();
+        drop(port_listener);
+        let mut web = Command::new(env!("CARGO_BIN_EXE_my-agent"))
+            .arg("--workspace").arg(&workspace).arg("serve").arg("--bind").arg(format!("127.0.0.1:{port}"))
+            .env("MY_AGENT_RUNTIME_DIR", &runtime_dir)
+            .env("MY_AGENT_CONFIG", workspace.join("empty-config.json"))
+            .env("API_TYPE", "ollama").env("MODEL_NAME", "mock").env("OPENAI_BASE_URL", &url)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let mut web_socket = None;
+        for _ in 0..100 {
+            if let Ok((connected, _)) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws")).await {
+                web_socket = Some(connected); break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut web_socket = web_socket.unwrap();
+        web_socket.send(WsMessage::Text(json!({"type":"connect","workspace":workspace}).to_string().into())).await.unwrap();
+        let _ = web_socket.next().await.unwrap().unwrap();
+        web_socket.send(WsMessage::Text(json!({"jsonrpc":"2.0","id":"web-survivor","method":"chat.send",
+            "params":{"session_id":session,"message":"resume after crash"}}).to_string().into())).await.unwrap();
+        let survivor = loop {
+            let listed = rpc(&socket, "list-survivor", "queue.list", json!({"session_id":session})).await;
+            if let Some(item) = listed["result"]["items"].as_array().and_then(|items| items.first()) { break item["run_id"].as_str().unwrap().to_owned(); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        drop(web_socket);
+        web.kill().await.unwrap(); web.wait().await.unwrap();
+        child.kill().await.unwrap(); child.wait().await.unwrap();
+        let (mut restarted, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        for _ in 0..100 {
+            let run = rpc(&socket, "survivor-read", "run.read", json!({"run_id":survivor})).await;
+            if run["result"]["status"] == "running" { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rpc(&socket, "survivor-read-final", "run.read", json!({"run_id":survivor})).await["result"]["status"], "running");
+        assert_eq!(rpc(&socket, "old-read", "run.read", json!({"run_id":running})).await["result"]["status"], "unknown_after_restart");
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 3);
+        restarted.kill().await.unwrap(); restarted.wait().await.unwrap(); server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    }).await.expect("queue contract timed out");
 }

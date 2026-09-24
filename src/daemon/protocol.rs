@@ -65,6 +65,12 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    pub fn failure_data(id: RequestId, code: i64, message: impl Into<String>, data: Value) -> Self {
+        let mut response = Self::failure(id, code, message);
+        response.error.as_mut().expect("failure error").data = Some(data);
+        response
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

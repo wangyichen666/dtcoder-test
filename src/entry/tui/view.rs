@@ -323,7 +323,7 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, state: &mut TuiState) {
         format!(
             " 正在工作 {} 轮 · 队列 {} · 可以先起草下一条 ",
             state.active_turns.len(),
-            state.queued_turns.len()
+            state.queued_count
         )
     } else {
         " 发送消息 ".to_owned()
@@ -464,7 +464,7 @@ fn status_line(state: &TuiState, theme: Theme, width: u16) -> Line<'static> {
         format!(
             "{} 活动 · {} 排队",
             state.active_turns.len(),
-            state.queued_turns.len()
+            state.queued_count
         )
     } else {
         format!("{} 个审批待处理", state.pending_approvals.len())
