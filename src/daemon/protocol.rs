@@ -1,3 +1,4 @@
+use crate::storage::{EventSeq, RunId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -93,6 +94,10 @@ pub struct EventFrame {
     pub request_id: RequestId,
     pub event: EventKind,
     pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_id: Option<RunId>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub seq: Option<EventSeq>,
 }
 
 impl EventFrame {
@@ -102,6 +107,8 @@ impl EventFrame {
             request_id,
             event,
             data,
+            run_id: None,
+            seq: None,
         }
     }
 }

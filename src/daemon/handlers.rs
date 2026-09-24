@@ -22,6 +22,9 @@ use crate::provider::ProviderProfile;
 use crate::safety::SafetyMode;
 use crate::session::SessionStatus;
 use crate::slash::{SlashAction, SlashParse, SlashRegistry, SlashResponse};
+use crate::storage::{
+    Admission, EventSeq, InteractionId, RunId, RunStatus, RuntimeError, SessionId, StoredEvent,
+};
 
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -51,6 +54,22 @@ struct CancelParams {
     request_id: RequestId,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    after_seq: Option<EventSeq>,
+}
+
+#[derive(Deserialize)]
+struct RunReadParams {
+    run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct RunEventsParams {
+    run_id: RunId,
+    #[serde(default)]
+    after_seq: Option<EventSeq>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -179,12 +198,23 @@ impl DaemonState {
             }
             "approval.respond" => {
                 let result = match parse_params::<ApprovalRespondParams>(&request.params) {
-                    Ok(params) => self
-                        .approvals
-                        .respond(&params.approval_id, params.approved)
-                        .await
-                        .map(|()| json!({"accepted": true}))
-                        .map_err(|error| (INVALID_PARAMS, format!("{error:#}"))),
+                    Ok(params) => {
+                        match self
+                            .approvals
+                            .respond(&params.approval_id, params.approved)
+                            .await
+                        {
+                            Ok(()) => self
+                                .run_store
+                                .answer_interaction(
+                                    &InteractionId(params.approval_id),
+                                    params.approved,
+                                )
+                                .map(|()| json!({"accepted": true}))
+                                .map_err(|error| (INTERNAL_ERROR, error.to_string())),
+                            Err(error) => Err((INVALID_PARAMS, format!("{error:#}"))),
+                        }
+                    }
                     Err(error) => Err((INVALID_PARAMS, error)),
                 };
                 send_result(&frames, request.id, result);
@@ -200,6 +230,35 @@ impl DaemonState {
                 send_result(&frames, request.id, result);
             }
             "agent.subscribe" => self.handle_subscribe(request, frames).await,
+            "run.read" => {
+                let result = parse_params::<RunReadParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .read_run(&params.run_id)
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                            .and_then(|run| {
+                                run.map(|run| json!(run))
+                                    .ok_or((INVALID_PARAMS, "run 不存在".into()))
+                            })
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "run.events" => {
+                let result = parse_params::<RunEventsParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .events_after(
+                                &params.run_id,
+                                params.after_seq.unwrap_or(EventSeq(0)),
+                                params.limit.unwrap_or(200),
+                            )
+                            .map(|events| json!({"events": events}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
             "slash.execute" => {
                 let result = match parse_params::<SlashExecuteParams>(&request.params) {
                     Ok(params) => {
@@ -261,6 +320,49 @@ impl DaemonState {
             }
         };
         let session_id = session.id.clone();
+        let admitted = match self.run_store.admit(
+            SessionId(session_id.clone()),
+            request.id.clone(),
+            &params.message,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                let code = if matches!(error, RuntimeError::Protocol(_)) {
+                    REQUEST_CONFLICT
+                } else {
+                    INTERNAL_ERROR
+                };
+                send_result(&frames, request.id, Err((code, error.to_string())));
+                return;
+            }
+        };
+        let run_record = match admitted {
+            Admission::New(run) => run,
+            Admission::Existing(run) => {
+                if run.status == RunStatus::Completed {
+                    send_result(
+                        &frames,
+                        request.id,
+                        Ok(
+                            json!({"content": run.content, "run_id": run.run_id, "turn_id": run.turn_id}),
+                        ),
+                    );
+                } else {
+                    send_result(
+                        &frames,
+                        request.id,
+                        Err((
+                            REQUEST_CONFLICT,
+                            format!(
+                                "已有相同 request id 的 run {}，状态 {:?}",
+                                run.run_id.0, run.status
+                            ),
+                        )),
+                    );
+                }
+                return;
+            }
+        };
         let started_at = Instant::now();
         info!(
             session_id = %session_id,
@@ -282,8 +384,20 @@ impl DaemonState {
             );
             return;
         }
-        active.insert(active_key.clone(), ActiveRequest::new(cancellation.clone()));
+        active.insert(
+            active_key.clone(),
+            ActiveRequest::new(cancellation.clone(), run_record.run_id.clone()),
+        );
         drop(active);
+        if let Err(error) = self.run_store.mark_running(&run_record.run_id) {
+            self.active.lock().await.remove(&active_key);
+            send_result(
+                &frames,
+                request.id,
+                Err((INTERNAL_ERROR, error.to_string())),
+            );
+            return;
+        }
 
         let (agent_events, mut event_receiver) = mpsc::unbounded_channel();
         let (approval_events, mut approval_receiver) = mpsc::unbounded_channel();
@@ -307,7 +421,7 @@ impl DaemonState {
                             &mut history,
                             params.message,
                             Some(agent_events),
-                            cancellation,
+                            cancellation.clone(),
                             Some(trace_request_id),
                         )
                         .await
@@ -336,6 +450,8 @@ impl DaemonState {
                             ActiveRequestUpdate::Event {
                                 kind: event.event,
                                 data: event.data,
+                                run_id: None,
+                                seq: None,
                             },
                         ).await;
                     }
@@ -353,18 +469,65 @@ impl DaemonState {
                 ActiveRequestUpdate::Event {
                     kind: event.event,
                     data: event.data,
+                    run_id: None,
+                    seq: None,
                 },
             )
             .await;
         }
 
-        let response = match result {
-            Ok(content) => Ok(json!({"content": content})),
-            Err(error) if error.to_string().contains("请求已取消") => {
+        let storage_error = self
+            .active
+            .lock()
+            .await
+            .get(&active_key)
+            .and_then(|active| active.storage_error.clone());
+        let response = match (storage_error, result) {
+            (Some(error), _) => Err((INTERNAL_ERROR, format!("持久化事件失败: {error}"))),
+            (None, Ok(content)) => Ok(
+                json!({"content": content, "run_id": run_record.run_id, "turn_id": run_record.turn_id}),
+            ),
+            (None, Err(ref error))
+                if cancellation.is_cancelled()
+                    || matches!(
+                        error.downcast_ref::<RuntimeError>(),
+                        Some(RuntimeError::Cancelled)
+                    ) =>
+            {
                 Err((REQUEST_CANCELLED, "请求已取消".to_owned()))
             }
-            Err(error) => Err((INTERNAL_ERROR, format!("{error:#}"))),
+            (None, Err(error)) => Err((INTERNAL_ERROR, format!("{error:#}"))),
         };
+        let terminal_status = match &response {
+            Ok(_) => RunStatus::Completed,
+            Err((REQUEST_CANCELLED, _)) => RunStatus::Cancelled,
+            Err(_) => RunStatus::Failed,
+        };
+        let content = response
+            .as_ref()
+            .ok()
+            .and_then(|value| value["content"].as_str());
+        let error = response
+            .as_ref()
+            .err()
+            .map(|(code, message)| (*code, message.as_str()));
+        if let Err(storage_error) =
+            self.run_store
+                .finish(&run_record.run_id, terminal_status, content, error)
+        {
+            tracing::error!(run_id = %run_record.run_id.0, error = %storage_error, "提交 run 终态失败");
+            send_result(
+                &frames,
+                request.id,
+                Err((INTERNAL_ERROR, format!("持久化终态失败: {storage_error}"))),
+            );
+            self.active.lock().await.remove(&active_key);
+            return;
+        }
+        if let Some(content) = content {
+            self.publish_committed_completion(&frames, &active_key, content)
+                .await;
+        }
         match &response {
             Ok(_) => info!(
                 session_id = %session_id,
@@ -867,6 +1030,30 @@ impl DaemonState {
                         ),
                     }
                 }
+                SlashAction::Run => {
+                    let id = RunId(invocation.args.join(" "));
+                    let run = self
+                        .run_store
+                        .read_run(&id)
+                        .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+                        .ok_or_else(|| (INVALID_PARAMS, format!("找不到 run: {}", id.0)))?;
+                    SlashResponse::Text {
+                        content: format!(
+                            "run_id={} · session_id={} · status={} · seq={} · terminal={}",
+                            run.run_id.0,
+                            run.session_id.0,
+                            serde_json::to_value(run.status)
+                                .unwrap_or_default()
+                                .as_str()
+                                .unwrap_or("unknown"),
+                            run.last_seq.0,
+                            run.content
+                                .as_deref()
+                                .or(run.error_message.as_deref())
+                                .unwrap_or("")
+                        ),
+                    }
+                }
                 SlashAction::Sessions => SlashResponse::Sessions {
                     sessions: self.session_infos().await?,
                     select: false,
@@ -1240,7 +1427,7 @@ impl DaemonState {
                 return;
             }
         };
-        let Some((replay, mut receiver)) = self
+        let active_match = self
             .active
             .lock()
             .await
@@ -1250,41 +1437,121 @@ impl DaemonState {
                     && params
                         .session_id
                         .as_deref()
-                        .is_none_or(|session_id| key.session_id == session_id)
+                        .is_none_or(|id| key.session_id == id)
             })
-            .map(|(_, active)| active.subscribe())
-        else {
-            send_result(
-                &frames,
-                request.id,
-                Ok(json!({
-                    "subscribed": false,
-                    "request_id": params.request_id,
-                    "reason": "请求未在执行",
-                })),
-            );
-            return;
+            .map(|(key, active)| (key.clone(), active.run_id.clone(), active.subscribe().1));
+        let run = if let Some((_, run_id, _)) = &active_match {
+            self.run_store.read_run(run_id)
+        } else if let Some(session_id) = params.session_id.as_deref() {
+            self.run_store.find_request(session_id, &params.request_id)
+        } else {
+            Ok(None)
         };
+        let run = match run {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                send_result(
+                    &frames,
+                    request.id,
+                    Ok(
+                        json!({"subscribed": false, "request_id": params.request_id, "reason": "请求未在执行"}),
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((INTERNAL_ERROR, error.to_string())),
+                );
+                return;
+            }
+        };
+        let mut cursor = params.after_seq.unwrap_or(EventSeq(0));
         let pending_ids = self
             .approvals
             .pending()
             .await
             .into_iter()
-            .map(|approval| approval.id)
-            .collect::<HashSet<String>>();
-        for update in replay {
-            if is_resolved_approval(&update, &pending_ids) {
-                continue;
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        let events = match self.run_store.events_after(&run.run_id, cursor, 1000) {
+            Ok(events) => events,
+            Err(error) => {
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((INTERNAL_ERROR, error.to_string())),
+                );
+                return;
             }
-            let terminal = matches!(update, ActiveRequestUpdate::Terminal(_));
-            let _ = frames.send(update.to_frame(request.id.clone()));
-            if terminal {
+        };
+        if events.len() == 1000 && events.last().is_some_and(|event| event.seq < run.last_seq) {
+            send_result(
+                &frames,
+                request.id,
+                Err((
+                    REQUEST_CONFLICT,
+                    format!(
+                        "事件回放超过单次上限；请从 seq {} 继续读取 run.events",
+                        events.last().map_or(cursor.0, |event| event.seq.0)
+                    ),
+                )),
+            );
+            return;
+        }
+        for event in events {
+            cursor = event.seq;
+            if let Some(update) = stored_event_update(event)
+                && !is_resolved_approval(&update, &pending_ids)
+                && frames.send(update.to_frame(request.id.clone())).is_err()
+            {
                 return;
             }
         }
+        if run.status == RunStatus::Completed {
+            send_result(
+                &frames,
+                request.id,
+                Ok(json!({"content": run.content, "run_id": run.run_id, "turn_id": run.turn_id})),
+            );
+            return;
+        }
+        if matches!(
+            run.status,
+            RunStatus::Failed | RunStatus::Cancelled | RunStatus::UnknownAfterRestart
+        ) {
+            send_result(
+                &frames,
+                request.id,
+                Err((
+                    run.error_code.unwrap_or(INTERNAL_ERROR),
+                    run.error_message
+                        .unwrap_or_else(|| format!("run 状态: {:?}", run.status)),
+                )),
+            );
+            return;
+        }
+        let Some((_, _, mut receiver)) = active_match else {
+            send_result(
+                &frames,
+                request.id,
+                Ok(
+                    json!({"subscribed": false, "request_id": params.request_id, "run_id": run.run_id, "reason": "请求没有活动执行体"}),
+                ),
+            );
+            return;
+        };
         loop {
             match receiver.recv().await {
                 Ok(update) => {
+                    if let ActiveRequestUpdate::Event { seq: Some(seq), .. } = &update {
+                        if *seq <= cursor {
+                            continue;
+                        }
+                        cursor = *seq;
+                    }
                     let terminal = matches!(update, ActiveRequestUpdate::Terminal(_));
                     if frames.send(update.to_frame(request.id.clone())).is_err() || terminal {
                         return;
@@ -1294,21 +1561,19 @@ impl DaemonState {
                     send_result(
                         &frames,
                         request.id,
-                        Ok(json!({
-                            "subscribed": false,
-                            "request_id": params.request_id,
-                            "reason": "请求已结束",
-                        })),
+                        Ok(
+                            json!({"subscribed": false, "request_id": params.request_id, "reason": "请求已结束"}),
+                        ),
                     );
                     return;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     send_result(
                         &frames,
                         request.id,
                         Err((
-                            INTERNAL_ERROR,
-                            format!("订阅落后 {skipped} 个事件，请重新连接恢复"),
+                            REQUEST_CONFLICT,
+                            format!("订阅事件出现缺口；请从 seq {} 调用 run.events", cursor.0),
                         )),
                     );
                     return;
@@ -1321,8 +1586,85 @@ impl DaemonState {
         &self,
         frames: &mpsc::UnboundedSender<ServerFrame>,
         active_key: &ActiveKey,
-        update: ActiveRequestUpdate,
+        mut update: ActiveRequestUpdate,
     ) {
+        if matches!(
+            update,
+            ActiveRequestUpdate::Event {
+                kind: EventKind::TurnCompleted,
+                ..
+            }
+        ) {
+            return; // The final content and terminal become visible after one SQLite commit.
+        }
+        let run_id = self
+            .active
+            .lock()
+            .await
+            .get(active_key)
+            .map(|active| active.run_id.clone());
+        if let (
+            Some(run_id),
+            ActiveRequestUpdate::Event {
+                kind,
+                data,
+                run_id: field_id,
+                seq,
+            },
+        ) = (&run_id, &mut update)
+        {
+            let name = serde_json::to_value(&*kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            match self.run_store.append_event(run_id, &name, data) {
+                Ok(next_seq) => {
+                    *field_id = Some(run_id.clone());
+                    *seq = Some(next_seq);
+                }
+                Err(error) => {
+                    tracing::error!(run_id = %run_id.0, %error, "持久化事件失败");
+                    if let Some(active) = self.active.lock().await.get_mut(active_key) {
+                        active.storage_error = Some(error.to_string());
+                        active.cancellation.cancel();
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(active) = self.active.lock().await.get_mut(active_key) {
+            active.publish(update.clone());
+        }
+        let _ = frames.send(update.to_frame(active_key.request_id.clone()));
+    }
+
+    async fn publish_committed_completion(
+        &self,
+        frames: &mpsc::UnboundedSender<ServerFrame>,
+        active_key: &ActiveKey,
+        content: &str,
+    ) {
+        let Some(active) = self
+            .active
+            .lock()
+            .await
+            .get(active_key)
+            .map(|active| active.run_id.clone())
+        else {
+            return;
+        };
+        let seq = self
+            .run_store
+            .read_run(&active)
+            .ok()
+            .flatten()
+            .map(|run| EventSeq(run.last_seq.0.saturating_sub(1)));
+        let update = ActiveRequestUpdate::Event {
+            kind: EventKind::TurnCompleted,
+            data: json!({"content": content}),
+            run_id: Some(active),
+            seq,
+        };
         if let Some(active) = self.active.lock().await.get_mut(active_key) {
             active.publish(update.clone());
         }
@@ -1678,13 +2020,33 @@ fn agent_event_update(event: AgentEvent) -> ActiveRequestUpdate {
             (EventKind::TurnCompleted, json!({"content": content}))
         }
     };
-    ActiveRequestUpdate::Event { kind, data }
+    ActiveRequestUpdate::Event {
+        kind,
+        data,
+        run_id: None,
+        seq: None,
+    }
+}
+
+fn stored_event_update(event: StoredEvent) -> Option<ActiveRequestUpdate> {
+    let kind = if event.event == "assistant_content" {
+        EventKind::TurnCompleted
+    } else {
+        serde_json::from_value::<EventKind>(Value::String(event.event)).ok()?
+    };
+    Some(ActiveRequestUpdate::Event {
+        kind,
+        data: event.data,
+        run_id: Some(event.run_id),
+        seq: Some(event.seq),
+    })
 }
 
 fn is_resolved_approval(update: &ActiveRequestUpdate, pending_ids: &HashSet<String>) -> bool {
     let ActiveRequestUpdate::Event {
         kind: EventKind::ApprovalRequired,
         data,
+        ..
     } = update
     else {
         return false;

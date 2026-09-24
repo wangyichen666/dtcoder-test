@@ -7,6 +7,7 @@ use crate::session::SessionInfo;
 pub enum SlashAction {
     Help,
     Status,
+    Run,
     Sessions,
     Resume,
     New,
@@ -55,6 +56,14 @@ const COMMANDS: &[SlashCommand] = &[
         usage: "/status",
         args: ArgSpec::None,
         action: SlashAction::Status,
+    },
+    SlashCommand {
+        name: "run",
+        aliases: &[],
+        help: "读取 daemon 中的 Run 状态与终态",
+        usage: "/run <run_id>",
+        args: ArgSpec::AtLeastOne("run ID"),
+        action: SlashAction::Run,
     },
     SlashCommand {
         name: "sessions",

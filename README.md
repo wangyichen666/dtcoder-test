@@ -188,6 +188,7 @@ my-agent
 /mcp       /ping      /dogfood    /web       /exit
 /permissions [request|risk|full]
 /models [编号|ID]
+/run <run_id>
 ```
 
 `/models` 不带参数时列出已保存配置；例如 `/models 2` 或 `/models deepseek` 会切换活动模型。Web 设置支持保存多个 OpenAI 兼容、Anthropic Messages 和 Ollama 配置；Agent 正在执行任务时切换会被拒绝，避免中途改变请求。
@@ -251,7 +252,8 @@ Cron：
 - **严格工具装配**：乱序、重复完成、缺失参数或不完整 EOF 会整轮拒绝，不执行半批副作用。
 - **受控长任务**：主任务没有固定 ReAct 轮次上限，每 50 轮检查进度；完全相同调用与结果连续 10 次才按无进展熔断。
 - **失败恢复**：工具失败会回填模型修复；连续 3 次工具失败则终止并返回明确原因。
-- **断线恢复**：daemon 为活动请求保留最多 1 MiB 事件回放；重新 `session.load` + `agent.subscribe` 可继续接收输出和审批。
+- **断线恢复**：daemon 在工作区 `.my-agent/runtime.sqlite3` 中保存 run、turn、事件序号、交互和终态，并保留活动请求的内存通知。`agent.subscribe` 先回放持久事件，再接实时通知；`run.read` / `run.events` 可在重启后查询。旧 JSONL 对话和 trace 保留。
+- **不确定结果**：daemon 重启时，未提交终态的 run 标为 `unknown_after_restart`，不会自动重放可能产生副作用的工作。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
 - **平滑升级**：ready 标记记录可执行文件内容指纹；重新构建后会优雅停止旧 daemon，再使用新版本启动。
 - **进程清理**：`exec` 默认 300 秒超时；取消或超时会清理整个子进程组。
 

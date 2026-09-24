@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::context::ContextManager;
 use crate::provider::{Message, Provider, ProviderEvent, Response, Role, ToolCall};
 use crate::session::{SessionStore, SessionTraceRecord};
+use crate::storage::RuntimeError;
 use crate::tool_calls::ToolCallAssembler;
 use crate::tools::{ToolCancellation, ToolOutput, ToolRegistry};
 
@@ -207,12 +208,12 @@ impl LoopEngine {
         trace_request_id: Option<&str>,
     ) -> Result<String> {
         if cancellation.is_cancelled() {
-            bail!("请求已取消");
+            return Err(RuntimeError::Cancelled.into());
         }
         let _turn_guard = match &self.session {
             Some(session) => Some(tokio::select! {
                 guard = session.lock_turn() => guard,
-                _ = cancellation.cancelled() => bail!("请求已取消"),
+                _ = cancellation.cancelled() => return Err(RuntimeError::Cancelled.into()),
             }),
             None => None,
         };
@@ -356,7 +357,7 @@ impl LoopEngine {
                     tokio::pin!(execute);
                     let results = tokio::select! {
                         results = &mut execute => results,
-                        _ = cancellation.cancelled() => bail!("请求已取消"),
+                        _ = cancellation.cancelled() => return Err(RuntimeError::Cancelled.into()),
                     };
                     let round_failures = results.iter().filter(|result| result.failed).count();
                     let last_error = results
@@ -501,7 +502,7 @@ impl LoopEngine {
                         );
                     }
                 }
-                _ = cancellation.cancelled() => break Err(anyhow::anyhow!("请求已取消")),
+                _ = cancellation.cancelled() => break Err(RuntimeError::Cancelled.into()),
             }
         };
         if let Err(error) = provider_result {

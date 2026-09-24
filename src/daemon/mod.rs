@@ -22,6 +22,7 @@ use crate::provider::{Message, ProviderManager};
 use crate::safety::SafetyPolicy;
 use crate::session::SessionStore;
 use crate::skills::SkillLibrary;
+use crate::storage::{EventSeq, RunId, RunStore};
 
 pub struct DaemonState {
     pub(crate) session: Arc<SessionStore>,
@@ -31,6 +32,7 @@ pub struct DaemonState {
     pub(crate) approvals: ApprovalBroker,
     pub(crate) safety: Option<Arc<SafetyPolicy>>,
     pub(crate) active: Mutex<HashMap<ActiveKey, ActiveRequest>>,
+    pub(crate) run_store: Arc<RunStore>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) skills: Option<SkillLibrary>,
     pub(crate) cron: Option<Arc<CronManager>>,
@@ -57,15 +59,28 @@ const ACTIVE_REPLAY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ActiveRequestUpdate {
-    Event { kind: EventKind, data: Value },
+    Event {
+        kind: EventKind,
+        data: Value,
+        run_id: Option<RunId>,
+        seq: Option<EventSeq>,
+    },
     Terminal(Result<Value, (i64, String)>),
 }
 
 impl ActiveRequestUpdate {
     pub(crate) fn to_frame(&self, request_id: RequestId) -> ServerFrame {
         match self {
-            Self::Event { kind, data } => {
-                ServerFrame::Event(EventFrame::new(request_id, kind.clone(), data.clone()))
+            Self::Event {
+                kind,
+                data,
+                run_id,
+                seq,
+            } => {
+                let mut frame = EventFrame::new(request_id, kind.clone(), data.clone());
+                frame.run_id = run_id.clone();
+                frame.seq = *seq;
+                ServerFrame::Event(frame)
             }
             Self::Terminal(Ok(result)) => {
                 ServerFrame::Response(JsonRpcResponse::success(request_id, result.clone()))
@@ -87,16 +102,20 @@ impl ActiveRequestUpdate {
 
 pub(crate) struct ActiveRequest {
     pub(crate) cancellation: CancellationToken,
+    pub(crate) run_id: RunId,
+    pub(crate) storage_error: Option<String>,
     updates: broadcast::Sender<ActiveRequestUpdate>,
     replay: VecDeque<ActiveRequestUpdate>,
     replay_bytes: usize,
 }
 
 impl ActiveRequest {
-    pub(crate) fn new(cancellation: CancellationToken) -> Self {
+    pub(crate) fn new(cancellation: CancellationToken, run_id: RunId) -> Self {
         let (updates, _) = broadcast::channel(1024);
         Self {
             cancellation,
+            run_id,
+            storage_error: None,
             updates,
             replay: VecDeque::new(),
             replay_bytes: 0,
@@ -214,6 +233,14 @@ impl DaemonState {
         daemon_log_path: PathBuf,
         safety: Option<Arc<SafetyPolicy>>,
     ) -> Self {
+        let run_store = Arc::new(
+            RunStore::open(
+                &session
+                    .path_for_session(&session.current_id_sync())
+                    .with_extension("sqlite3"),
+            )
+            .expect("测试 SQLite run store"),
+        );
         Self::new_with_services_and_log_path_and_safety_and_provider(
             engine,
             history,
@@ -226,6 +253,7 @@ impl DaemonState {
             safety,
             None,
             ConfigStore::default(),
+            run_store,
         )
     }
 
@@ -242,6 +270,7 @@ impl DaemonState {
         safety: Option<Arc<SafetyPolicy>>,
         provider_manager: Option<Arc<ProviderManager>>,
         config_store: ConfigStore,
+        run_store: Arc<RunStore>,
     ) -> Self {
         let default_session_id = session.current_id_sync();
         let default_session = Arc::new(SessionRuntime {
@@ -258,6 +287,7 @@ impl DaemonState {
             approvals,
             safety,
             active: Mutex::new(HashMap::new()),
+            run_store,
             shutdown: CancellationToken::new(),
             skills,
             cron,

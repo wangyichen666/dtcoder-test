@@ -18,6 +18,7 @@ use crate::provider::{Provider, ProviderManager, ProviderProfile};
 use crate::safety::SafetyPolicy;
 use crate::session::SessionStore;
 use crate::skills::SkillLibrary;
+use crate::storage::RunStore;
 use crate::sub_agent::SubAgentTool;
 use crate::tools::{EditFileTool, ExecTool, ReadFileTool, ToolRegistry, WriteFileTool};
 
@@ -91,6 +92,13 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
         skills.clone(),
     )?;
     let session = Arc::new(SessionStore::from_env(workspace));
+    let run_store = Arc::new(RunStore::open(
+        &workspace.join(".my-agent/runtime.sqlite3"),
+    )?);
+    let recovered = run_store.recover()?;
+    if recovered > 0 {
+        tracing::warn!(recovered, "将重启时未确认的 run 标为 unknown_after_restart");
+    }
     let history = session.load().await?;
     let engine = Arc::new(LoopEngine::new(provider, tools, context, session.clone()));
     let state = Arc::new(
@@ -106,6 +114,7 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
             Some(safety),
             Some(provider_manager),
             config_store,
+            run_store,
         ),
     );
     cron.start(state.shutdown.clone()).await;

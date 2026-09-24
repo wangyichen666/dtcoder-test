@@ -169,7 +169,11 @@ impl Approval for ApprovalBroker {
             .try_with(Clone::clone)
             .map_err(|_| anyhow::anyhow!("当前没有可接收审批事件的 daemon 请求"))?;
         let sequence = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let approval_id = format!("approval-{sequence}");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let approval_id = format!("approval-{}-{nonce}-{sequence}", std::process::id());
         let (response, receiver) = oneshot::channel();
         let info = PendingApprovalInfo {
             id: approval_id.clone(),

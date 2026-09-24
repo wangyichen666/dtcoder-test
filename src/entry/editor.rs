@@ -243,6 +243,7 @@ async fn run_acp_slash(
         &parsed,
         SlashParse::Command(crate::slash::SlashInvocation {
             action: SlashAction::Help
+                | SlashAction::Run
                 | SlashAction::Status
                 | SlashAction::Sessions
                 | SlashAction::Ping,
@@ -270,7 +271,7 @@ async fn run_acp_slash(
             .map_err(|error| internal_error(anyhow::Error::from(error)))?;
         render_acp_slash_response(response)
     } else {
-        "ACP 入口仅支持只读 slash 命令：/help、/status、/sessions、/ping、/mcp list、/mcp status。会话切换请使用 ACP session/new 或 session/load。".to_owned()
+        "ACP 入口仅支持只读 slash 命令：/help、/run、/status、/sessions、/ping、/mcp list、/mcp status。会话切换请使用 ACP session/new 或 session/load。".to_owned()
     };
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
