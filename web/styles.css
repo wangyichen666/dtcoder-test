@@ -18,6 +18,7 @@
 
 * { box-sizing: border-box; }
 html, body { min-height: 100%; margin: 0; }
+html { scroll-behavior: smooth; }
 body {
   background:
     radial-gradient(circle at 10% 0%, rgba(13, 102, 91, .1), transparent 29rem),
@@ -27,6 +28,9 @@ body {
 button, input, textarea { font: inherit; }
 button { color: inherit; }
 h1, h2, h3, p { margin: 0; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 3px solid rgba(22,136,120,.32); outline-offset: 2px;
+}
 
 .app-shell { min-height: 100vh; padding: 16px 18px 18px; }
 .topbar {
@@ -72,6 +76,10 @@ h1, h2, h3, p { margin: 0; }
   min-width: 38px; height: 38px; cursor: pointer;
 }
 .icon-button:hover, .quiet-button:hover { background: var(--white); border-color: rgba(13,102,91,.38); }
+.icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 10px; }
+.settings-button { color: var(--muted); font-size: 12px; }
+.retry-button { color: var(--red); border-color: rgba(173,67,59,.25); }
+.quiet-button.compact { min-width: auto; height: 34px; padding: 0 10px; font-size: 11px; }
 
 .view { display: none; }
 .view.is-active { display: block; }
@@ -86,7 +94,7 @@ h1, h2, h3, p { margin: 0; }
 .panel-heading, .conversation-heading, .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .panel-heading h1, .panel-heading h2, .dialog-heading h2 { margin-top: 5px; font-family: Georgia, "Times New Roman", serif; font-size: 25px; font-weight: 500; }
 
-.conversation-panel, .session-detail { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.conversation-panel, .session-detail { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .session-detail { grid-template-rows: auto minmax(0, 1fr) auto; }
 .conversation-heading { padding: 16px 24px 13px; border-bottom: 1px solid var(--line); }
 .conversation-heading h1 { margin-top: 5px; font: 600 25px/1.15 Georgia, serif; }
@@ -108,6 +116,13 @@ h1, h2, h3, p { margin: 0; }
 
 .transcript { min-height: 0; overflow: auto; padding: 22px clamp(16px, 3vw, 44px); scroll-behavior: smooth; }
 .readonly-transcript { padding-inline: clamp(18px, 3vw, 48px); }
+.jump-latest {
+  position: absolute; z-index: 2; right: clamp(28px, 4vw, 58px); bottom: 132px;
+  padding: 8px 12px; border: 1px solid rgba(13,102,91,.2); border-radius: 999px;
+  color: var(--teal); background: rgba(255,253,248,.95); box-shadow: 0 7px 20px rgba(43,51,43,.13);
+  cursor: pointer; font-size: 11px; font-weight: 700; transition: transform .16s ease, box-shadow .16s ease;
+}
+.jump-latest:hover { transform: translateY(-1px); box-shadow: 0 10px 24px rgba(43,51,43,.18); }
 .empty-state { height: 100%; min-height: 320px; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--muted); }
 .empty-orbit { display: grid; place-items: center; width: 60px; height: 60px; margin-bottom: 18px; border: 1px solid rgba(13,102,91,.25); border-radius: 50%; color: var(--teal); background: var(--teal-soft); font-size: 24px; }
 .empty-state h2, .empty-state h3 { color: var(--ink); font-family: Georgia, serif; font-size: 24px; font-weight: 500; }
@@ -174,10 +189,11 @@ h1, h2, h3, p { margin: 0; }
 .approval-actions { display: flex; gap: 8px; }
 .approval-actions button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--white); cursor: pointer; }
 .approval-actions .approve { color: white; background: var(--teal); border-color: var(--teal); }
+.approval-actions button:disabled { opacity: .55; cursor: wait; }
 
 .composer { margin: 0 22px 22px; border: 1px solid rgba(13,102,91,.24); border-radius: 16px; background: var(--white); box-shadow: 0 12px 35px rgba(43,51,43,.08); overflow: hidden; }
 .composer:focus-within { border-color: rgba(13,102,91,.55); box-shadow: 0 12px 35px rgba(13,102,91,.12); }
-.composer textarea { display: block; width: 100%; min-height: 88px; max-height: 220px; resize: vertical; padding: 16px 17px 8px; border: 0; outline: 0; color: var(--ink); background: transparent; line-height: 1.55; }
+.composer textarea { display: block; width: 100%; min-height: 88px; max-height: 220px; resize: none; overflow-y: auto; padding: 16px 17px 8px; border: 0; outline: 0; color: var(--ink); background: transparent; line-height: 1.55; }
 .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 9px 9px 16px; color: var(--muted); font-size: 10px; }
 .composer-context { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 8px; }
 .composer-context .workspace-trigger { flex: 1 1 220px; max-width: 330px; }
@@ -185,14 +201,19 @@ h1, h2, h3, p { margin: 0; }
 .composer-context .workspace-trigger, .composer-context .permission-trigger { min-height: 34px; padding: 5px 9px; }
 .composer-context .workspace-trigger strong, .composer-context .permission-trigger strong { font-size: 10px; }
 .composer-actions { flex: none; display: flex; align-items: center; gap: 12px; }
+.composer-actions > span { white-space: nowrap; }
+#prompt-count { color: #84908a; }
 kbd { padding: 2px 4px; margin-right: 2px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--paper); font: inherit; }
 .send-button { padding: 10px 15px; }
 
 .activity-panel, .session-panel, .trace-panel { padding: 22px 18px 16px; display: flex; flex-direction: column; }
-.status-pill { padding: 7px 10px; border-radius: 999px; color: var(--teal); background: var(--teal-soft); font: 700 10px ui-monospace, monospace; }
+.status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 999px; color: var(--teal); background: var(--teal-soft); font: 700 10px ui-monospace, monospace; }
+.status-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .status-pill.running { color: white; background: var(--teal); }
 .status-pill.waiting { color: #80501c; background: #f5dfba; }
 .status-pill.error { color: white; background: var(--red); }
+.status-pill.running::before { animation: status-pulse 1.15s ease-in-out infinite; }
+@keyframes status-pulse { 50% { opacity: .35; transform: scale(.72); } }
 .workspace-card, .task-card { padding: 15px; margin-top: 16px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.44); }
 .workspace-card > span, .task-card > span { display: block; color: var(--muted); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .workspace-card strong, .task-card strong { display: block; margin: 7px 0 11px; overflow-wrap: anywhere; font: 650 11px/1.5 ui-monospace, monospace; }
@@ -326,6 +347,10 @@ dialog::backdrop { background: rgba(21,31,28,.32); backdrop-filter: blur(5px); }
 .toast { position: fixed; z-index: 20; left: 50%; bottom: 25px; transform: translate(-50%, 20px); padding: 10px 14px; border-radius: 10px; color: white; background: #23312d; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: .2s ease; font-size: 12px; }
 .toast.show { transform: translate(-50%, 0); opacity: 1; }
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: auto auto 1fr; }
   .connection span { display: none; }
@@ -355,6 +380,7 @@ dialog::backdrop { background: rgba(21,31,28,.32); backdrop-filter: blur(5px); }
   .transcript { padding: 20px 16px; }
   .message { max-width: 94%; }
   .composer { margin: 0 10px 10px; }
+  .jump-latest { right: 24px; bottom: 142px; }
   .composer-footer { flex-wrap: wrap; gap: 8px; }
   .composer-context { flex: 1 1 100%; width: 100%; }
   .composer-context .workspace-trigger { max-width: none; }
@@ -380,4 +406,6 @@ dialog::backdrop { background: rgba(21,31,28,.32); backdrop-filter: blur(5px); }
   .primary-nav button { padding-inline: 11px; }
   .heading-actions { flex-direction: column-reverse; align-items: flex-end; }
   .composer-actions > span { display: none; }
+  .settings-button span { display: none; }
+  .settings-button { padding-inline: 8px; }
 }

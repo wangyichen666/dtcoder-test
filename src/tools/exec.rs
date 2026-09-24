@@ -91,6 +91,8 @@ impl ExecTool {
             .spawn()
             .with_context(|| format!("执行命令失败: {}", args.command))?;
         let process_id = child.id();
+        // 父 turn 取消时可能直接丢弃这个 future；仍需终止已启动的进程组。
+        let mut process_guard = ProcessGroupGuard::new(process_id);
         let timeout = execution_timeout();
         let wait = child.wait_with_output();
         tokio::pin!(wait);
@@ -99,14 +101,17 @@ impl ExecTool {
             _ = cancellation.cancelled() => {
                 terminate_process_group(process_id);
                 let _ = (&mut wait).await;
+                process_guard.disarm();
                 bail!("命令执行已取消: {}", args.command);
             }
             _ = tokio::time::sleep(timeout) => {
                 terminate_process_group(process_id);
                 let _ = (&mut wait).await;
+                process_guard.disarm();
                 bail!("命令执行超时（{} 秒）: {}", timeout.as_secs(), args.command);
             }
         };
+        process_guard.disarm();
 
         let stdout = limited_lossy(&output.stdout);
         let stderr = limited_lossy(&output.stderr);
@@ -116,6 +121,26 @@ impl ExecTool {
             stdout,
             stderr
         ))
+    }
+}
+
+struct ProcessGroupGuard {
+    process_id: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_id: Option<u32>) -> Self {
+        Self { process_id }
+    }
+
+    fn disarm(&mut self) {
+        self.process_id = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        terminate_process_group(self.process_id);
     }
 }
 

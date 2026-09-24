@@ -1579,6 +1579,10 @@ mod tests {
         requests: std::sync::atomic::AtomicUsize,
     }
 
+    struct TruncatedToolStream {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
     #[async_trait]
     impl Provider for InvalidArgumentsStream {
         async fn chat_stream(
@@ -1609,6 +1613,40 @@ mod tests {
                 }
             } else {
                 events.send(ProviderEvent::TextDelta("已修正".to_owned()))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for TruncatedToolStream {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            events: tokio::sync::mpsc::UnboundedSender<crate::provider::ProviderEvent>,
+        ) -> Result<()> {
+            use crate::provider::{
+                ApiType, ExecutionIdentity, ProviderEvent, ToolArgumentsFragment,
+            };
+            if self
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                let exec_id = ExecutionIdentity::wire(ApiType::OpenaiChat, "truncated-call");
+                events.send(ProviderEvent::ToolCallStarted {
+                    exec_id: exec_id.clone(),
+                    name: "side_effect".to_owned(),
+                })?;
+                events.send(ProviderEvent::ToolCallDelta {
+                    exec_id: exec_id.clone(),
+                    fragment: ToolArgumentsFragment::Append(r#"{"value":"unsafe"}"#.to_owned()),
+                })?;
+                events.send(ProviderEvent::ToolCallCompleted { exec_id })?;
+                events.send(ProviderEvent::OutputTruncated)?;
+            } else {
+                events.send(ProviderEvent::TextDelta("已改为安全回答".to_owned()))?;
             }
             Ok(())
         }
@@ -1775,6 +1813,39 @@ mod tests {
                 .content
                 .as_deref()
                 .is_some_and(|content| content.contains("tool_call_assembly_error:invalid_json"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_batch_is_rejected_before_side_effects_and_retried() {
+        let provider = Arc::new(TruncatedToolStream {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(SideEffectProbe {
+            name: "side_effect",
+            executions: executions.clone(),
+        });
+        let engine = LoopEngine::new(
+            provider.clone(),
+            registry,
+            test_context(provider),
+            test_session("truncated-tool-batch"),
+        );
+        let mut history = Vec::new();
+
+        let answer = engine
+            .run_turn(&mut history, "不要执行截断调用".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(answer, "已改为安全回答");
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(history.iter().any(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                content.contains("tool_call_assembly_error:output_truncated")
+            })
         }));
     }
 

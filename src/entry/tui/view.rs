@@ -469,7 +469,7 @@ fn status_line(state: &TuiState, theme: Theme, width: u16) -> Line<'static> {
     } else {
         format!("{} 个审批待处理", state.pending_approvals.len())
     };
-    let (indicator, indicator_color) = match state.activity_phase {
+    let (indicator, indicator_color) = match state.activity_phase() {
         ActivityPhase::WaitingApproval => ("◆ ".to_owned(), theme.warm),
         phase if phase.is_animated() => (
             indeterminate_indicator(state.animation_tick, width >= 55),
@@ -513,37 +513,33 @@ fn indeterminate_indicator(tick: u64, show_bar: bool) -> String {
 
 fn render_help(frame: &mut Frame<'_>, state: &TuiState, theme: Theme, content: Rect) {
     let width = content.width.min(72);
-    let height = content.height.min(18);
+    let help_entries = super::keybindings::help_entries().collect::<Vec<_>>();
+    let height = content
+        .height
+        .min((help_entries.len() as u16).saturating_add(6));
     let area = Rect::new(
         content.x + content.width.saturating_sub(width) / 2,
         content.y + content.height.saturating_sub(height) / 2,
         width,
         height,
     );
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "快捷键",
             theme.style(theme.info).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Enter        发送消息"),
-        Line::from("Alt+Enter    插入换行"),
-        Line::from("↑ / ↓        浏览输入历史"),
-        Line::from("Ctrl+↑ / ↓   滚动对话"),
-        Line::from("Ctrl+Home    跳到对话顶部"),
-        Line::from("Ctrl+End     回到底部"),
-        Line::from("Ctrl+T       展开/收起工具调用与输出（默认折叠）"),
-        Line::from("Ctrl+K       清空排队消息"),
-        Line::from("Ctrl+C       取消当前请求"),
-        Line::from("/            显示内置命令；↑↓ 选择，Tab 补全"),
-        Line::from("Ctrl+/       打开/关闭帮助"),
-        Line::from("Esc          关闭帮助 / 退出"),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("当前 session: {}", short_id(&state.session_id, 32)),
-            theme.muted_style(),
-        )),
     ];
+    lines.extend(
+        help_entries
+            .into_iter()
+            .map(|(keys, description)| Line::from(format!("{keys:<20}{description}"))),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("当前 session: {}", short_id(&state.session_id, 32)),
+        theme.muted_style(),
+    )));
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1113,7 +1109,10 @@ mod tests {
     #[test]
     fn active_status_uses_an_animated_indeterminate_progress_bar() {
         let mut state = fixture();
-        state.activity_phase = ActivityPhase::WaitingModel;
+        state.set_turn_phase(
+            &crate::daemon::protocol::RequestId::String("preview-active".into()),
+            ActivityPhase::WaitingModel,
+        );
         state.status = "等待模型响应".into();
         state.animation_tick = 0;
         let first = status_line(&state, Theme::new(TuiThemeMode::Terminal), 80)
@@ -1130,7 +1129,13 @@ mod tests {
         assert!(first.contains('[') && first.contains(']'));
         assert_ne!(first, second);
 
-        state.activity_phase = ActivityPhase::WaitingApproval;
+        state
+            .pending_approvals
+            .push_back(crate::daemon::approval::PendingApprovalInfo {
+                id: "status-approval".into(),
+                request_id: crate::daemon::protocol::RequestId::String("preview-active".into()),
+                prompt: "允许测试？".into(),
+            });
         let approval = status_line(&state, Theme::new(TuiThemeMode::Terminal), 80)
             .spans
             .iter()

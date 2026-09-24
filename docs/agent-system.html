@@ -677,7 +677,7 @@
         <article class="panel status-card">
           <span class="badge done">已实现</span>
           <h3>多 Agent / 子 Agent</h3>
-          <p><code>sub_agent</code> 不继承主历史、不写主 session、默认只读且不能递归，只把最终结论交回主 Agent。</p>
+          <p><code>sub_agent</code> 不继承主历史、不写主 session 且不能递归；可并发处理最多 4 个独立只读子任务，并把各自结论交回主 Agent。</p>
         </article>
         <article class="panel status-card">
           <span class="badge done">已实现</span>
@@ -746,7 +746,7 @@
           <div class="step-no">06</div>
           <div class="step-body">
             <h3>流式调用模型</h3>
-            <p>Provider 分别适配 OpenAI Chat Completions、Anthropic Messages 与 Ollama，将 SSE/NDJSON 的思考增量、正文增量和工具事件统一透传；唯一 canonical assembler 负责工具参数重组与 fail-closed。</p>
+            <p>Provider 分别适配 OpenAI Chat Completions、Anthropic Messages 与 Ollama，将 SSE/NDJSON 的思考增量、正文增量、停止原因和工具事件统一透传；唯一 canonical assembler 负责工具参数重组与 fail-closed。若输出达到 token 上限且包含工具调用，整批调用会在任何副作用前被拒绝并交给既有重试链路。</p>
             <div class="branch">
               <div class="branch-text"><strong>纯文本</strong><br>模型认为任务完成，转到第 11 步。</div>
               <div class="branch-tools"><strong>工具调用</strong><br>进入参数、安全和执行链路。</div>
@@ -845,8 +845,8 @@
         </article>
         <article class="panel tool-card">
           <div class="tool-head"><h3><code>sub_agent</code></h3><span class="tool-kind">副作用 · 串行</span></div>
-          <p>把自洽子任务放进全新历史执行；默认工具为 read_file / exec / recall_memory，最多 15 轮。</p>
-          <div class="params">{ "task": "调研配置读取位置", "tools": ["read_file", "exec"] }</div>
+          <p>单任务使用全新历史，默认工具为 read_file / exec / recall_memory；传入 tasks 可并发处理最多 4 个独立任务，默认只开放 read_file / recall_memory。每个子任务最多 15 轮；主请求取消时子任务也会取消。</p>
+          <div class="params">{ "tasks": ["调研配置读取位置", "调研配置写入位置"] }</div>
         </article>
       </div>
     </section>
@@ -868,7 +868,7 @@
         <article class="panel status-card">
           <span class="badge done">上下文隔离</span>
           <h3>受限子 Agent</h3>
-          <p><code>sub_agent</code> 使用全新历史完成边界清晰的调研子任务，只把最终结论带回主对话。默认工具受限、最多 15 轮、不写主 session，也不能再次派生子 Agent。</p>
+          <p><code>sub_agent</code> 使用全新历史完成边界清晰的子任务，只把最终结论带回主对话。支持最多 4 个只读子任务并发；每个任务最多 15 轮、不写主 session，也不能再次派生子 Agent。</p>
         </article>
         <article class="panel status-card">
           <span class="badge done">成本优化</span>
@@ -1063,7 +1063,7 @@
             <li>复杂任务可要求“先制定计划”；大范围调研可要求“交给子 Agent，只返回结论”。</li>
             <li>要求记忆时明确说“记住……”；需要偏好时可明确说“先回忆……”。</li>
             <li>可把工作方法写入 <code>.my-agent/skills/*.md</code>，标题使用一级标题，摘要使用 <code>summary:</code>。</li>
-            <li>TUI 默认使用 <code>terminal</code> 主题并继承终端颜色；真彩终端可用 <code>MY_AGENT_TUI_THEME=dark|light myagent</code> 启用内置主题。对话区采用层级化 transcript、默认折叠的工具摘要、任务完成标记和 sticky-bottom 新消息提示。输入 <code>/</code> 会实时显示内置命令及简介，继续输入可按前缀过滤，使用上下方向键选择、Tab 补全。Enter 发送、Alt+Enter 换行，支持多行粘贴、CJK 光标编辑与单行历史；<code>PageUp/PageDown</code> 翻页，Ctrl+上下逐行、Ctrl+Home/End 首尾，Ctrl+T 锚定本轮原 Query 并内联展开/收起工具细节，Ctrl+K 清空队列，Ctrl-C 取消最近活动 turn；模型等待、流式输出、工具执行期间状态栏持续播放不确定进度动画，进入审批或终态后停止。按 Ctrl+/ 打开快捷键帮助（Mac 终端可用）。设 <code>MY_AGENT_TUI_MOUSE=1</code> 才捕获鼠标滚轮，Esc 关闭帮助、命令提示或退出；<code>exec</code> 工具默认 300 秒超时，可用 <code>MY_AGENT_EXEC_TIMEOUT_SECS</code> 调整，取消/超时会清理子进程组。</li>
+            <li>TUI 默认使用 <code>terminal</code> 主题并继承终端颜色；真彩终端可用 <code>MY_AGENT_TUI_THEME=dark|light myagent</code> 启用内置主题。对话区采用层级化 transcript、默认折叠的工具摘要、任务完成标记和 sticky-bottom 新消息提示。输入 <code>/</code> 会实时显示内置命令及简介，继续输入可按前缀过滤，使用上下方向键选择、Tab 补全。Enter 发送、Alt+Enter 或 Ctrl+J 换行，支持多行粘贴、组合字符/emoji 字素安全编辑与单行历史；Ctrl/Alt+左右按词移动，Ctrl+D 向后删除。<code>PageUp/PageDown</code> 翻页，Ctrl+上下逐行、Ctrl+Home/End 首尾，Ctrl+T 锚定本轮原 Query 并内联展开/收起工具细节，Ctrl+K 清空队列，Ctrl-C 取消最近活动 turn；多个并发 turn 按真实阶段聚合状态，模型等待、流式输出、工具执行期间状态栏持续播放不确定进度动画，进入审批或终态后停止。快捷键处理与帮助由同一 action keymap 生成，按 Ctrl+/ 打开帮助（Mac 终端可用）。设 <code>MY_AGENT_TUI_MOUSE=1</code> 才捕获鼠标滚轮，Esc 关闭帮助、命令提示或退出；<code>exec</code> 工具默认 300 秒超时，可用 <code>MY_AGENT_EXEC_TIMEOUT_SECS</code> 调整，取消/超时会清理子进程组。</li>
             <li>输入 <code>/resume</code> 查看带编号、消息数和首条问题摘要的历史 session；<code>/web</code> 在默认 <code>127.0.0.1:8787</code> 幂等启动/复用 Web 工作台，并以 URL 参数打开当前目录。页面内可继续选择其他项目，每个目录使用独立 daemon。共享 Slash 命令还包括 <code>/help</code>、<code>/status</code>、<code>/sessions</code>、<code>/new</code>、<code>/cancel</code>、<code>/permissions [request|risk|full]</code>、<code>/models [编号|ID]</code>、<code>/skill</code>、<code>/cron</code>、<code>/mcp</code>、<code>/ping</code>、<code>/dogfood</code> 和 <code>/exit</code>。</li>
             <li><code>serve</code> 同时提供 Web 页面、HTTP/SSE 与 <code>/ws</code>；WebSocket 首帧可发送 <code>{"type":"connect","token":"...","workspace":"/absolute/project"}</code>。服务端规范化并校验目录，为不同目录连接独立 daemon，后续帧使用 JSON-RPC 2.0。可用 <code>MY_AGENT_WEB_ADDR</code> 调整 TUI <code>/web</code> 的回环监听地址。</li>
             <li>编辑器接入请选择标准 ACP v1；客户端断线后重新 <code>session/load</code>，再订阅快照中的活动请求即可恢复输出和审批。</li>

@@ -39,6 +39,7 @@ pub struct ToolCallAssembler {
     calls: BTreeMap<ExecutionIdentity, PendingCall>,
     order: Vec<ExecutionIdentity>,
     failure: Option<ToolCallStreamError>,
+    output_truncated: bool,
 }
 
 struct PendingCall {
@@ -63,6 +64,10 @@ impl ToolCallAssembler {
                 Some(delta)
             }
             ProviderEvent::ThinkingDelta(_) => None,
+            ProviderEvent::OutputTruncated => {
+                self.output_truncated = true;
+                None
+            }
             ProviderEvent::ToolCallStarted { exec_id, name } => {
                 if name.trim().is_empty() {
                     self.fail("missing_name", "工具调用名称为空");
@@ -154,6 +159,12 @@ impl ToolCallAssembler {
     pub fn finish(self) -> Response {
         if let Some(error) = self.failure {
             return Response::ToolAssemblyFailed(error);
+        }
+        if self.output_truncated && !self.calls.is_empty() {
+            return Response::ToolAssemblyFailed(ToolCallStreamError::new(
+                "output_truncated",
+                "模型响应达到输出 token 上限，工具参数可能被截断；本轮工具调用已全部拒绝",
+            ));
         }
         for identity in &self.order {
             if self.calls.get(identity).is_some_and(|call| !call.completed) {
@@ -286,6 +297,32 @@ mod tests {
             incomplete.finish(),
             Response::ToolAssemblyFailed(ToolCallStreamError { code, .. }) if code == "incomplete_call"
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_tool_batch_but_keeps_truncated_text() {
+        let id = identity("truncated");
+        let mut tool = ToolCallAssembler::default();
+        tool.accept(ProviderEvent::ToolCallStarted {
+            exec_id: id.clone(),
+            name: "demo".to_owned(),
+        });
+        tool.accept(ProviderEvent::ToolCallDelta {
+            exec_id: id.clone(),
+            fragment: ToolArgumentsFragment::Append("{}".to_owned()),
+        });
+        tool.accept(ProviderEvent::ToolCallCompleted { exec_id: id });
+        tool.accept(ProviderEvent::OutputTruncated);
+        assert!(matches!(
+            tool.finish(),
+            Response::ToolAssemblyFailed(ToolCallStreamError { code, .. })
+                if code == "output_truncated"
+        ));
+
+        let mut text = ToolCallAssembler::default();
+        text.accept(ProviderEvent::TextDelta("未完正文".to_owned()));
+        text.accept(ProviderEvent::OutputTruncated);
+        assert_eq!(text.finish(), Response::Text("未完正文".to_owned()));
     }
 
     #[test]

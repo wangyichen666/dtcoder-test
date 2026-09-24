@@ -202,6 +202,9 @@ fn consume_ndjson_line(
         }
     }
     if chunk.done {
+        if chunk.done_reason.as_deref() == Some("length") {
+            send_event(events, ProviderEvent::OutputTruncated)?;
+        }
         debug!(
             provider = "ollama",
             input_tokens = chunk.prompt_eval_count.unwrap_or(0),
@@ -219,6 +222,7 @@ struct OllamaChunk {
     message: Option<OllamaMessage>,
     #[serde(default)]
     done: bool,
+    done_reason: Option<String>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
     error: Option<String>,
@@ -298,6 +302,19 @@ mod tests {
             receiver.try_recv().unwrap(),
             ProviderEvent::ThinkingDelta("先规划".to_owned())
         );
+    }
+
+    #[test]
+    fn emits_output_truncated_for_length_done_reason() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut position = 0;
+        consume_ndjson_line(
+            br#"{"done":true,"done_reason":"length"}"#,
+            &mut position,
+            &events,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), ProviderEvent::OutputTruncated);
     }
 
     #[test]

@@ -228,6 +228,9 @@ fn consume_sse_line(
         for delta in choice.delta.tool_calls {
             consume_tool_delta(delta, calls, events)?;
         }
+        if choice.finish_reason.as_deref() == Some("length") {
+            send_event(events, ProviderEvent::OutputTruncated)?;
+        }
     }
     Ok(())
 }
@@ -386,6 +389,7 @@ struct PromptTokenDetails {
 #[derive(Deserialize)]
 struct StreamChoice {
     delta: StreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -499,6 +503,19 @@ mod tests {
             receiver.try_recv().unwrap(),
             ProviderEvent::ThinkingDelta("先检查项目结构".to_owned())
         );
+    }
+
+    #[test]
+    fn emits_output_truncated_for_length_finish_reason() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut calls = BTreeMap::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            &mut calls,
+            &events,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), ProviderEvent::OutputTruncated);
     }
 
     #[test]

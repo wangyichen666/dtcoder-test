@@ -48,21 +48,21 @@
 
 TUI 默认继承当前终端主题，也可启用内置 `dark` / `light` 语义色板。它不是简单的日志滚屏：
 
-- 层级化 transcript、CJK 安全编辑、多行输入、历史草稿和发送队列。
+- 层级化 transcript、Unicode 字素安全编辑（组合字符/emoji）、多行输入、历史草稿和发送队列。
 - 工具调用默认聚合；`Ctrl+T` 锚定最近一条原 Query，在原对话中内联展开详情。
 - 输入 `/` 实时显示内置命令及简介；继续输入可按前缀过滤，`↑/↓` 选择、`Tab` 补全。
-- 模型等待、流式输出、工具执行期间持续显示不确定进度动画。
+- 多个并发 turn 按真实阶段聚合状态；模型等待、流式输出、工具执行期间持续显示不确定进度动画。
 - 审批、完成、失败、取消和连接中断都有明确终态；滚离底部时提示新消息。
 - 页眉持续显示本地 Web 地址；`/web` 幂等启动或复用控制台，并打开当前工作目录对应的 Agent 工作台。
-- `Ctrl+/` 查看快捷键，`Ctrl+C` 取消当前请求，`/resume` 恢复历史会话。
+- 快捷键处理与帮助共用一份 action keymap；`Ctrl+/` 查看帮助，`Ctrl+C` 取消当前请求，`/resume` 恢复历史会话。
 
 ## 核心能力
 
 | 能力 | 当前实现 |
 |---|---|
-| **多 Provider** | OpenAI Chat Completions、Anthropic Messages、Ollama；协议差异封装在适配器内，统一输出严格 tool-call 生命周期事件。 |
+| **多 Provider** | OpenAI Chat Completions、Anthropic Messages、Ollama；协议差异封装在适配器内，统一输出严格 tool-call 生命周期事件；达到 token 上限的工具批次整批拒绝并安全重试。 |
 | **8 个内置工具** | `read_file`、`write_file`、`edit_file`、`exec`、`remember`、`recall_memory`、`plan`、`sub_agent`。 |
-| **计划与子 Agent** | 可重写、可持久化任务计划；子 Agent 使用全新历史、受限工具、最多 15 轮预算且不能递归派生。 |
+| **计划与子 Agent** | 可重写、可持久化任务计划；`sub_agent` 支持单任务及最多 4 个独立只读任务并发，每个子任务使用全新历史、受限工具和最多 15 轮预算，不能递归派生；取消主请求时同步取消子任务。 |
 | **图片与 PDF** | PNG/JPEG/WebP 可作为视觉内容块；PDF 在本地抽取最多 50 页文字；不支持时给出明确降级。 |
 | **三条记忆链路** | 独立 session JSONL、60%/85% 两级上下文摘要、带 TTL 的关键词/中文 bigram 长期记忆。 |
 | **Skill** | `.my-agent/skills/*.md` 使用 YAML frontmatter 与 semver，按当前请求稳定排序并按需加载正文。 |
@@ -309,7 +309,7 @@ MCP server 以当前用户权限运行，只应连接可信本地配置。图片
 src/main.rs                Clap 子命令与启动分发
 src/client.rs              Unix / 内存 DaemonClient
 src/daemon/                状态、协议、审批、运行时、生命周期、server
-src/entry/                 TUI、CLI、Web/HTTP/WS、ACP 与恢复适配
+src/entry/                 TUI（含独立 keymap）、CLI、Web/HTTP/WS、ACP 与恢复适配
 src/provider.rs            Provider 公共契约与 execution identity
 src/provider/              OpenAI、Anthropic、Ollama 适配器
 src/tool_calls.rs          canonical tool-call assembler

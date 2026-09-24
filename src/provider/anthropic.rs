@@ -260,7 +260,12 @@ fn consume_sse_line(
         "content_block_start" => start_content_block(&value, state, events)?,
         "content_block_delta" => consume_content_delta(&value, state, events)?,
         "content_block_stop" => stop_content_block(&value, state, events)?,
-        "message_delta" => log_usage("message_delta", value.get("usage")),
+        "message_delta" => {
+            log_usage("message_delta", value.get("usage"));
+            if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+                send_event(events, ProviderEvent::OutputTruncated)?;
+            }
+        }
         "error" => {
             send_event(
                 events,
@@ -480,5 +485,18 @@ mod tests {
             receiver.try_recv().unwrap(),
             ProviderEvent::ThinkingDelta("再回答".to_owned())
         );
+    }
+
+    #[test]
+    fn emits_output_truncated_for_max_tokens_stop_reason() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut state = StreamState::default();
+        consume_sse_line(
+            br#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8192}}"#,
+            &mut state,
+            &events,
+        )
+        .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), ProviderEvent::OutputTruncated);
     }
 }

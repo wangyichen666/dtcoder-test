@@ -498,3 +498,136 @@
 - 保留 workspace-label、permission-label 和两个 trigger 的既有 DOM ID，移动节点不会影响 setAgentControls、目录切换、权限 RPC 或禁用状态。
 - 顶部选择器移动后，composer context 在桌面横向排列，在 820px 以下自动换行；390px 视口仍能显示“工作目录 / 权限模式”标签和当前值。
 - 通过隔离模拟 Ollama 实际发送一轮任务，页面在思考增量期间显示“生成中”，随后自动折叠思考并显示 Markdown 表格响应，证明本轮只改变布局和提示文案。
+
+# 2026-09-13 参考 pi 的 TUI 与 Agent 架构优化
+
+- pi 是多 package TypeScript monorepo；本轮重点目录为 `packages/tui`（终端组件/输入/渲染）、`packages/coding-agent`（交互会话与应用编排）和 `packages/agent`（模型-工具循环）。
+- 当前项目是单 Rust binary crate，TUI 位于 `src/entry/tui.rs`、`src/entry/tui/*`，Agent 主循环位于 `src/loop_engine.rs`，daemon 负责 session、审批、取消与活动请求真相。
+- pi 根级 `AGENTS.md` 要求宽泛改动前完整阅读文件；后续读取相关目标文件全文，不依据零散搜索片段直接设计。
+- 当前工作树在恢复长期规划文件后为干净状态；pi 仓库只读。
+- pi 将通用 TUI 库与 coding-agent 应用层分离：`packages/tui` 提供差分渲染、布局、Editor、ScrollView、overlay、keybinding 等基础能力；`packages/coding-agent/modes/interactive` 负责 Agent 会话投影与交互编排；`packages/agent` 独立承载模型/工具状态机。
+- 当前 Rust 项目仍是单 crate，相关模块体量已经较大：`entry/tui.rs` 1383 行、`entry/tui/view.rs` 1252 行、`loop_engine.rs` 1823 行、`daemon/handlers.rs` 1771 行。是否拆模块应依据职责耦合和测试边界，而不是照搬 monorepo。
+- pi 的 TUI 核心实现规模也很大，需优先阅读 `tui.ts`、main/alt screen、Editor/ScrollView 和 coding-agent 的薄适配层；Agent 流程优先阅读 `agent-loop.ts`、`agent.ts`、types 与 runtime service，避免被 6000+ 行 interactive mode 的细节淹没。
+- pi TUI 自述定位是“差分渲染的终端 UI 库”；当前 Rust 项目使用 ratatui/crossterm，差分缓冲已由依赖提供，因此本轮关注上层状态/组件/交互设计，不重复造底层 renderer。
+
+## 待确认
+
+- pi TUI 的组件树、增量重绘、宽字符输入、快捷键和 overlay 设计中，哪些能力当前项目仍缺失。
+- pi agent loop 的事件模型、消息变换、工具调度、取消/错误与 steering/follow-up 流程，哪些适合映射到 daemon 协议。
+
+## 当前 Rust TUI 基线
+
+- `TuiState` 同时持有领域投影（消息、工具、turn、审批）、视图状态（scroll、overlay、theme、render cache）和输入/快捷键状态；`tui.rs` 还同时承担终端生命周期、事件泵、RPC frame reducer、slash 与提交队列，职责耦合明显。
+- 已有优点不应重做：`UiMessage`/`UiToolCall` 结构化投影、稳定 message id/content version、按宽度/主题缓存、follow-bottom/unread、队列发送、多活动 turn、审批队列、终端 Drop 恢复和 bracketed paste 都已实现。
+- 当前事件泵每 16ms 调用同步 `crossterm::event::poll`，随后最多 128 次对每个 RPC stream 做 1ms timeout 轮询；这使终端输入、网络流和动画依赖固定轮询，空闲时也持续唤醒。若 pi 使用失效调度/统一事件源，这是高价值对照点。
+- 快捷键散落在 `handle_key` 的条件分支中（F1/Ctrl+/、Ctrl+T/U/K/C、编辑、滚动、审批），缺少动作级 keymap；pi 根规则明确要求默认快捷键进入集中 keybinding 表，这很可能适合移植为 Rust `Action` 映射。
+- `ActivityPhase` 目前是单个全局枚举，而状态允许多个 active turn；任何一个 ToolFinished 都会把 phase 改回 WaitingModel，无法准确表达并发 turn 的综合活动状态。后续需检查 daemon 是否实际串行以及视图是否只需要聚合状态。
+- ThinkingDelta 当前只更新状态文案，不把思考内容投影为 TUI message；这是 Web 已支持而 TUI 尚未展示的能力，但是否本轮实现要结合 pi 的 loader/thinking 交互。
+- `view.rs` 已有响应式布局、窄屏兜底、审批/slash/help overlay、三主题语义色、CJK 列宽换行和 TestBackend 回归，视觉基础比简单 demo 完整。
+- 每次绘制会 `clone()` 整个 `messages`，再对每条缓存行进行 clone；流式输出时最后一条消息的 content_version 每片段变化，而历史消息仍被整体复制。`wrap_lines` 又把每个 Unicode 字符拆成独立 `Span`，长会话会造成明显分配/克隆压力。
+- `draw_ui` 为处理锚点会直接 `take()` 并修改 scroll/follow-bottom/unread/cache 等状态，模型投影与布局计算难以独立测试。适合逐步引入 pi 风格的组件/视图模型边界，但不宜一轮重写所有渲染。
+- 渲染缓存 key 覆盖 message/version/width/tools/theme，正确性较好；容量达到 512 时整表清空，旧 content_version 项在阈值前保留。可考虑以 message id 定向失效或用稳定组件缓存替代全表清空。
+- 帮助文案与 `handle_key` 是两份手工维护的快捷键真相；集中 `Action -> bindings -> help` 可同时降低漂移和提高可配置性。
+
+## 当前 Rust 输入与 Agent 循环基线
+
+- `InputEditor` 使用 `Vec<char> + scalar cursor`，能避免 UTF-8 字节切割并正确计算 CJK 显示列；但中部插入/删除为 O(n)，只支持左右/行首尾/空白分词，缺少多行上下移动、撤销/重做、kill ring。是否补齐要对照 pi Editor 的能力与复杂度，优先选择用户可感知且测试容易的子集。
+- `LoopEngine` 已具备不少成熟设计：会话 turn 锁、协作取消、流式 thinking/text、严格 tool-call 装配与整批准入、连续只读并行/副作用串行、重复/失败熔断、长任务检查点、图片瞬态上下文和结构化 trace。
+- Agent 生命周期事件是闭合但较粗的 `AgentEvent`：TurnStarted、thinking/text delta、tool started/finished、TurnCompleted；错误和取消没有独立终态事件，由上层 future/RPC error 表达。TUI reducer 因此要同时解释事件流与 response。
+- 当前 Agent loop 把编排、事件生成、持久化、trace、provider 流装配、工具调度、重复检测集中在 1823 行单文件中；生产实现约 900 行，后半主要是高质量回归测试。拆分的合理方向是内部职责模块，而不是改变对外 `LoopEngine` API。
+- TUI 的排队消息只存在客户端内存，Agent 内核没有 pi 式 steering/follow-up 概念；活动任务期间的输入不会进入当前模型循环，只会在完成后作为新 turn。需对照 pi 的明确语义后决定是否值得扩协议。
+- 当前 `execute_in_waves` 仅并行“相邻的只读调用”，用 `buffered(8)` 保持结果顺序；这比无序并行更利于 tool_call_id 回填，应该保留。
+
+## pi TUI：快捷键、滚动与输入
+
+- pi 用声明式 `Keybinding -> defaultKeys + description` 注册表和 `KeybindingsManager` 解析默认/用户覆盖、去重与冲突；组件只匹配语义动作。这个设计可在当前项目先落一个无配置的 Rust 精简版：集中定义 `TuiAction` 与匹配/帮助元数据，再让 `handle_key` 消费动作，后续配置化不必再改业务逻辑。
+- pi 的 `ScrollView` 明确区分 follow-end、用户在末尾抑制 follow、content/viewport 尺寸、overscroll chain/contain，并让 `scrollBy` 返回未消费行数；当前项目的 `scroll + follow_bottom` 已覆盖主要语义，但布局计算散在 `draw_ui`。现阶段可借鉴状态不变量与测试，暂不需要复制 scrollbar/timer。
+- pi 的 `EditorComponent` 是小而稳定的可替换接口，使应用层可以注入 Vim/Emacs 等编辑器；当前项目没有扩展系统，直接引入 trait 收益暂不足，但应把 InputEditor 保持为独立模块并避免 TUI 应用逻辑进入其中。
+- pi 输入组件按 grapheme cluster 移动/删除，当前 Rust 按 Unicode scalar，面对组合字符、ZWJ emoji 会拆坏用户可见字符。这是明确的正确性差距，Rust 可通过 `unicode-segmentation` 修复并补回归。
+- pi 已实现 undo coalescing、delete word forward、delete to line start/end、kill/yank/yank-pop；当前项目的 Ctrl+U 是整框 clear、Ctrl+K 被占作清空发送队列。可优先补“按字素删除/移动”和多行编辑常用键，避免直接改变现有 Ctrl+K 队列语义造成兼容问题。
+- pi 词导航使用 `Intl.Segmenter` 并单独处理标点，优于当前只按 whitespace 分词；Rust 若引入复杂分词会扩大依赖/语义差异，本轮更适合先修字素安全。
+
+## pi TUI：核心渲染与焦点
+
+- pi 把所有界面单元抽象为 `Component(render/invalidate/optional input/mouse)`，`Container` 只做组合；overlay 有独立栈、focus owner、pre-focus 恢复、可见性与 bounds。当前项目只有单个 help bool + 固定审批/slash 区，短期无需完整 overlay framework，但可把 help/approval 输入优先级显式化为模式/action reducer。
+- pi 的关键性能策略不是盲目循环，而是 `requestRender` 合并失效、16ms 最大帧率节流；键盘输入走 immediate render 降低延迟。当前项目 `dirty` 也避免每圈重绘，但 RPC 读取仍用每 stream 的 1ms timeout 轮询，可能把一轮延迟叠加到活动流数量上。
+- pi 终端输入、resize 与组件 `requestRender` 都是事件驱动；当前可先将 RPC stream 的“等待 1ms”改成单次非阻塞 poll，避免最多 128ms 的串行超时成本，再评估引入 crossterm EventStream 的完整 select。
+- pi 集中处理终端 query 回复、key release、鼠标坐标转换、IME 硬件光标和 overlay focus；ratatui/crossterm 已替当前项目承担不少底层工作，不应复制 ANSI compositor。
+- pi 的 overlay 与 component 系统代码复杂度很高（仅 `tui.ts` 1456 行），说明“拆组件”本身不是免费收益；当前项目适合先抽纯状态 reducer/keymap，并用已有 ratatui Widget 继续渲染。
+
+## pi TUI：屏幕与聊天布局
+
+- pi 的 main-screen 自研行级 diff、同步输出、超大写入分块、Kitty 图片与 scrollback 对齐；当前项目运行在 alternate screen 且 ratatui 已维护前后 buffer，因此不应迁移这段终端 renderer。
+- coding-agent 的 `createChatViewport` 非常薄：transcript 是唯一 grow 区，pending/status/editor/footer 组成可收缩 dock。当前 `draw_ui` 已基本采用同一布局原则，但将所有区块计算写在一个函数里；可抽 layout 计算纯函数以提高边界测试，不需要引入组件框架。
+- pi fullscreen 把 transcript search、滚动条、文本选择、OSC8 链接等放在通用 TUI 层，而应用层只提供主题和回调。这些是长期演进方向；本轮最值得低成本借鉴的是“按上一/下一用户 prompt 跳转”的语义滚动，因为当前已有稳定 message id/锚点，可用集中 keybinding 接入。
+- pi fullscreen 的 PageUp/PageDown 留 4 行重叠、滚轮/逐行/半页动作明确；当前固定 PageUp 8 行在不同终端高度下体验不一致。可改为按 transcript viewport 高度减重叠滚动，但需要把上次 viewport height 放入状态或由事件处理计算。
+- pi 能在退出 alternate screen 时把最终文档重绘回主屏；当前项目退出后清空 TUI，不保留会话输出。这是体验差异，但会改变既有 alternate-screen 语义，优先级低于编辑正确性和事件循环。
+
+## pi Agent loop：前半
+
+- pi 明确分离 `AgentMessage` 与 provider `Message`，只在模型调用边界做 transform/convert；当前项目的 `provider::Message` 同时是会话领域模型和 wire 近似模型，导致 thinking/image/tool 字段需要各 provider 小心忽略。长期可引入领域消息层，但本轮全面迁移风险较大。
+- pi 事件生命周期更正交：agent_start/end、turn_start/end、message_start/update/end、tool_execution_start/update/end；事件携带完整 partial message，TUI/其他消费者只做投影。当前事件较少但够用；最明显缺口是 error/aborted 没有显式事件终态。
+- pi 在流式开始时把 partial assistant message 放入 context，后续就地替换，最终 `message_end`；当前项目只在 Provider 完成后记录 assistant message，崩溃/断开时已流式展示的正文不会进 session。若要提高恢复一致性，应设计“草稿事件/trace”，不能简单对每 delta append JSONL。
+- pi 把 steering（下一次模型调用前注入）与 follow-up（Agent 原本将停止后再启动下一 turn）分开，并在耗时 `prepareNextTurn` 后重新取 steering；当前 TUI 只有 follow-up 队列且在客户端，语义应至少命名清楚，若扩展 steering 需 daemon 成为队列真相源。
+- pi 有 `prepareNextTurn`、`shouldStopAfterTurn`、transformContext 等 hook，使 compaction/模型切换/策略可插拔；当前 Rust 直接调用 ContextManager 和固定循环。可以先抽内部 `TurnStep`/终态 helper，而不为了扩展性预先引入大量 trait。
+- pi 对 provider stopReason=`length` 的整批工具调用 fail-closed，避免截断 arguments 被 salvage 后误执行；当前严格 assembler 能拒绝无效 JSON，但若截断后 JSON 恰好合法且缺失字段，schema admission 可能拦截，仍应核对 provider 是否保留 finish_reason 并作整批拒绝。
+- pi 工具调度默认并行，任一工具声明 sequential 则整批串行；当前“只读并行、副作用串行”安全策略更保守，更适合本项目，不建议改成 pi 默认。
+
+## pi Agent loop：工具与类型契约
+
+- pi 把工具处理拆为 prepare（查找、参数适配、schema 验证、before hook）、execute（支持 partial update）、finalize（after hook）、message artifact 四步；当前项目 ToolRegistry 已负责查找/准入/执行，但 `LoopEngine::execute_one` 同时做事件、trace、错误归一化、fingerprint。可抽内部 helper/模块，降低主循环认知负担。
+- pi 的事件 sink 可异步等待，从而严格保证 start/update/end 顺序和下游落盘完成；当前用 unbounded channel，不会反压 Agent，但慢消费者可能积压。对本地单用户 Agent 可接受，避免贸然让 TUI 速度阻塞模型；trace 继续由 LoopEngine 直接落盘更可靠。
+- pi 工具支持 partial result update 与 structured details；当前工具只在完成时产生 `ToolOutput`，长命令的 TUI 无实时 stdout。这个能力价值高但涉及 Tool trait、exec 子进程读取、daemon 协议与多入口，适合后续独立批次而非顺手扩张。
+- pi `AgentState` 明确定义 isStreaming、streamingMessage、pendingToolCalls、errorMessage 等派生运行态；当前 TUI/daemon 通过多个集合和单个 ActivityPhase 自行推断。可在 TUI 先用纯函数从 active turns + approvals + running tools 派生聚合 phase，避免事件顺序覆盖状态。
+- pi 的 AgentTool 有 replay safe/never 与 per-tool executionMode，反映持久恢复与并行策略属于工具元数据；当前仅 `is_read_only`。若未来做崩溃后工具恢复，应新增 replay policy，而不是把工具默认重放。
+- pi 将 stopReason=error/aborted 编码在 final assistant message，`agent_end` 仍正常闭合；当前 Rust 用 `Result` 返回失败更惯用，但协议事件可以补 `TurnFailed { cancelled, error }`，让所有入口不必从 RPC error 反推终态。
+
+## 当前 Provider 停止原因核对
+
+- 全仓 `finish_reason/stop_reason` 搜索表明当前三个 provider 都未把停止原因传入 `ProviderEvent`/`Response`；OpenAI 兼容 SSE 的 `finish_reason`、Anthropic `message_delta.stop_reason`、Ollama `done_reason` 均会丢失。
+- 因此当前确实无法实现 pi 的“输出因 token 上限截断时整批工具调用 fail-closed”：如果截断恰好形成合法 JSON 且满足 schema，工具可能执行。这是比纯结构拆分更优先的 Agent 流程安全改进。
+- 合理的最小设计是新增 provider 层统一停止原因事件/枚举，在 assembler 完成前把 `length/max_tokens` 转成 `ToolCallFailed(code=output_truncated)`；若本轮只有文本而无工具调用，仍允许返回已生成文本并在 trace/日志标记，避免无谓破坏现有行为。
+- 实施前仍需完整读取 `tool_calls.rs` 和三个 provider 的流解析文件，确认事件顺序及各协议停止字段。
+
+## Provider/Assembler 完整阅读结论
+
+- `ToolCallAssembler` 已是严格单一装配点，并在任何 `ToolCallFailed` 后保留已收到文本但最终返回 assembly failure；新增 `OutputTruncated` 事件最适合由 assembler 在 `finish()` 时根据 `calls.is_empty()` 决定是否失败，provider 无需感知完整调用状态。
+- OpenAI `StreamChoice` 当前只反序列化 `delta`，可增加 `finish_reason: Option<String>`；当值为 `length` 时发 `OutputTruncated`。事件通常在 tool delta 后、`[DONE]` 前到达，随后 `complete_calls` 再发 Completed，assembler 可保留首个截断失败。
+- Anthropic `message_delta` 当前只记录 usage，实际停止原因位于 `delta.stop_reason`；值 `max_tokens` 应发截断事件。tool block 往往已 content_block_stop，因此不能依赖 `StreamState.tools` 判断是否曾有工具，交给 assembler 判断正确。
+- Ollama `OllamaChunk` 已解析 `done`，可增加 `done_reason`；值 `length` 发截断事件。工具调用在同一/之前 chunk 已进入 assembler。
+- 对无工具的截断文本，assembler 应继续返回 `Response::Text`，保持 pi 的语义；对任意已开始/完成工具调用则返回 `ToolAssemblyFailed(code=output_truncated)`，LoopEngine 现有“回填系统纠错消息并有限重试”路径可直接复用。
+- `ProviderEvent` 是内部非序列化 enum，新增变体不会破坏 daemon wire 协议；需要同步 `emit_legacy_response`、assembler match、LoopEngine `consume_provider_event` 的穷尽匹配及三 provider 单测。
+
+## pi Agent 状态包装与当前基线
+
+- pi 的 `Agent` 将低层 loop 包成唯一 activeRun，集中拥有 abort、waitForIdle、steering/follow-up queue，并用 event reducer 维护 streamingMessage/pendingToolCalls/errorMessage；异常也合成为完整 message/turn/agent 终态。当前 daemon 已承担 active request/取消/会话真相，因此不应再在 `LoopEngine` 外复制一个 Agent wrapper，但 TUI 应从集合派生聚合运行态。
+- pi 的 session runtime 在切换/新建/fork 前先 `abort()` 并等待旧 turn settle，再 teardown/rebind，避免结果写入新 session。当前 daemon 已禁止活动 turn 时切换 session，这个策略更简单安全，应保留。
+- pi 本地 provider 映射再次确认：OpenAI `finish_reason=length`、Anthropic `stop_reason=max_tokens` 都统一为 stopReason `length`，支持本轮映射设计。
+- 当前全量基线为 `cargo test --all-targets` 143/143，通过且耗时约 1.36s。
+
+## 本轮选定落地范围
+
+- TUI：新增集中式语义 `TuiAction` keymap，让处理逻辑和帮助文案共享注册表；不在本轮做用户配置文件，先消除双真相。
+- TUI：输入编辑改为 grapheme cluster 安全，覆盖组合音标和 ZWJ emoji；保留现有快捷键语义。
+- TUI：每个 active turn 独立记录 phase，顶部状态从 pending approvals/running tools/active turns 派生，修复并发事件互相覆盖；RPC stream 轮询改为单次非阻塞 poll，消除每流 1ms 累加等待。
+- Agent：Provider 统一发出输出截断事件；assembler 只在截断响应包含工具调用时整批 fail-closed，无工具的截断文本保持兼容；LoopEngine 复用既有有限纠错重试。
+- 结构：新增 `entry/tui/keybindings.rs`，保持 provider 协议适配分文件与 assembler 单一边界；不做单 crate→workspace 或大规模搬文件，因为当前 daemon/入口共享内部类型，机械拆 crate 会增加公开 API 面而缺少直接收益。
+- `unicode-segmentation 1.13.3` 已由 ratatui 间接锁定在现有 `Cargo.lock`，将其声明为直接精确依赖不会引入新下载或锁文件版本漂移。
+
+## 实施与最终结论
+
+- 集中式 `TuiAction` 注册表已成为按键解析和帮助弹层的共同真相源；保留原快捷键并增加 Alt+左右、Ctrl+J、Ctrl+D、Alt+Backspace 等 pi 风格别名。后续若要支持用户自定义，只需替换绑定来源，不再改业务 reducer。
+- `InputEditor` 已改为 UTF-8 字符串和字素边界光标；组合字符、ZWJ emoji 及中部插入后边界吸附均有测试，末尾输入保持 O(1) 快路径。
+- TUI phase 已从“最后一个事件覆盖全局枚举”改为 per-turn facts + 聚合优先级；审批、工具执行、流式、等待和恢复不会再被并发 turn 相互覆盖。RPC stream 改用公平轮转的非阻塞 poll，移除每流 1ms 串行等待。
+- OpenAI `finish_reason=length`、Anthropic `stop_reason=max_tokens`、Ollama `done_reason=length` 已统一为 `OutputTruncated`；canonical assembler 对含工具的截断响应整批拒绝，LoopEngine 走原有有限重试，纯文本截断保持兼容。端到端回归证明合法 JSON 的副作用调用也不会执行。
+- 结构上只抽出高内聚的 `entry/tui/keybindings.rs`，没有照搬 pi 的 monorepo 或自研 ANSI renderer。现有 ratatui、daemon 单一真相源与 provider/assembler 分层继续保留。
+- 后续若继续演进，优先级建议为：① 将 `loop_engine.rs` 的工具波次/trace/provider round 拆成内部模块；② 把客户端排队升级为 daemon-owned follow-up/steering；③ 为长工具增加 partial output 事件；④ 最后再评估领域 Message 与 provider wire Message 分离。上述项目均涉及公共协议或恢复语义，不适合在本轮低风险优化中顺带改动。
+- 最终门禁：`cargo fmt --all -- --check`、`cargo check --all-targets`、严格 Clippy、`cargo test --all-targets`（153/153）、`cargo build --release`、`git diff --check` 全部通过；pi 仓库保持未修改。
+
+## Web 前端体验优化结论（2026-09-13）
+
+- 现有 Web 页面已经具备完整的 Agent、Session、模型、权限和目录能力，本轮不改变 RPC 或 DOM ID，只改善状态连续性与反馈层。
+- 流式 transcript 现在区分“用户仍在底部”与“用户正在查看历史”：前者自动跟随，后者保持滚动位置并提供“回到最新”入口。
+- 审批请求进入前端 state，重绘、切换视图和流式增量不会丢失审批卡；提交审批时按钮会锁定，失败可恢复。
+- composer 增加自适应高度、字数提示、明确的 ARIA 描述；连接失败提供可见的“重试连接”；状态 pill 增加文字之外的动态指示，并支持 reduced-motion。
+- 浏览器静态回归确认窄屏 684px 下 `scrollWidth=684`，无横向溢出；控制台无 error/warning。前端改动通过 Node 语法检查，Rust 嵌入资源通过全量测试和 release 构建。

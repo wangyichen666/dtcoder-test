@@ -25,6 +25,8 @@
     traceFilter: "all",
     activeRequest: null,
     draftAssistant: null,
+    pendingApproval: null,
+    agentFollowBottom: true,
     activities: [],
     activeView: "agent",
     collapsedDays: new Set(),
@@ -158,6 +160,7 @@
     const node = $("#connection");
     node.className = `connection is-${mode}`;
     node.querySelector("span").textContent = label;
+    $("#retry-connection").classList.toggle("hidden", mode !== "error");
   }
 
   function setAgentControls() {
@@ -169,6 +172,9 @@
     $("#workspace-trigger").disabled = Boolean(state.activeRequest);
     $("#change-workspace").disabled = Boolean(state.activeRequest);
     $("#permission-trigger").disabled = !state.connected || Boolean(state.activeRequest);
+    $("#send").setAttribute("aria-busy", String(Boolean(state.activeRequest)));
+    $("#agent-transcript").setAttribute("aria-busy", String(Boolean(state.activeRequest)));
+    updateLatestButton();
   }
 
   function updateWorkspaceUi() {
@@ -590,15 +596,39 @@
   }
 
   function renderTranscript(node, messages, agentMode) {
+    const followLatest = !agentMode || state.agentFollowBottom || isNearBottom(node);
     const html = messages.map((message) => renderMessage(message, agentMode)).join("");
-    node.innerHTML = html || (agentMode ? agentEmptyTemplate() : `
+    const approval = agentMode && state.pendingApproval ? renderApprovalCard(state.pendingApproval) : "";
+    const empty = agentMode ? agentEmptyTemplate() : `
       <div class="empty-state">
         <span class="empty-orbit">⌁</span>
         <h2>空白 Session</h2>
         <p>这个 Session 暂时没有消息。</p>
-      </div>`);
+      </div>`;
+    node.innerHTML = `${html || empty}${approval}`;
     if (agentMode) bindStarterButtons();
-    requestAnimationFrame(() => { node.scrollTop = node.scrollHeight; });
+    if (agentMode) bindApprovalCard();
+    requestAnimationFrame(() => {
+      if (followLatest) node.scrollTop = node.scrollHeight;
+      if (agentMode) updateLatestButton(node);
+    });
+  }
+
+  function isNearBottom(node) {
+    return node.scrollHeight - node.scrollTop - node.clientHeight < 72;
+  }
+
+  function updateLatestButton(node = $("#agent-transcript")) {
+    if (!node) return;
+    state.agentFollowBottom = isNearBottom(node);
+    $("#jump-latest").classList.toggle("hidden", state.agentFollowBottom || !state.activeRequest);
+  }
+
+  function scrollAgentToLatest() {
+    const node = $("#agent-transcript");
+    node.scrollTop = node.scrollHeight;
+    state.agentFollowBottom = true;
+    updateLatestButton(node);
   }
 
   function agentEmptyTemplate() {
@@ -612,6 +642,24 @@
         <button type="button" data-starter="阅读当前项目，帮我实现一个合理的小功能并完成验证。">开始开发功能</button>
       </div>
     </div>`;
+  }
+
+  function renderApprovalCard(approval) {
+    return `<section class="approval-card" data-approval-card>
+      <strong>需要审批</strong>
+      <p>${escapeHtml(approval.prompt || "Agent 请求执行受保护操作")}</p>
+      <div class="approval-actions">
+        <button class="approve" type="button" data-approval-choice="approve">允许</button>
+        <button class="deny" type="button" data-approval-choice="deny">拒绝</button>
+      </div>
+    </section>`;
+  }
+
+  function bindApprovalCard() {
+    const card = $("[data-approval-card]");
+    if (!card || !state.pendingApproval) return;
+    card.querySelector('[data-approval-choice="approve"]')?.addEventListener("click", () => respondApproval(state.pendingApproval.id, true, card));
+    card.querySelector('[data-approval-choice="deny"]')?.addEventListener("click", () => respondApproval(state.pendingApproval.id, false, card));
   }
 
   function renderMessage(message) {
@@ -822,6 +870,8 @@
       state.agentSessionId = snapshot.session_id;
       state.agentSnapshot = snapshot;
       state.activities = [];
+      state.pendingApproval = null;
+      state.agentFollowBottom = true;
       state.thinkingFinished = false;
       renderAgentTranscript();
       renderActivities();
@@ -853,6 +903,8 @@
     state.agentSessionId = null;
     state.agentSnapshot = null;
     state.activities = [];
+    state.pendingApproval = null;
+    state.agentFollowBottom = true;
     state.thinkingFinished = false;
     renderAgentTranscript();
     renderActivities();
@@ -877,10 +929,13 @@
     try {
       const sessionId = await ensureAgentSession();
       $("#prompt").value = "";
+      resizePrompt();
       state.agentSnapshot ||= { messages: [] };
       state.agentSnapshot.messages ||= [];
       state.agentSnapshot.messages.push({ role: "user", content: prompt });
       state.draftAssistant = { role: "assistant", content: "" };
+      state.pendingApproval = null;
+      state.agentFollowBottom = true;
       state.thinkingFinished = false;
       state.agentSnapshot.messages.push(state.draftAssistant);
       state.activities = [];
@@ -915,6 +970,7 @@
     } finally {
       state.activeRequest = null;
       state.draftAssistant = null;
+      state.pendingApproval = null;
       $("#cancel-turn").classList.add("hidden");
       setAgentControls();
       await refreshSessionListOnly().catch(() => {});
@@ -982,23 +1038,23 @@
 
   function renderApproval(approval) {
     if (!approval) return;
-    const card = document.createElement("div");
-    card.className = "approval-card";
-    card.innerHTML = `<strong>需要审批</strong><p>${escapeHtml(approval.prompt || "Agent 请求执行受保护操作")}</p>
-      <div class="approval-actions"><button class="approve" type="button">允许</button><button class="deny" type="button">拒绝</button></div>`;
-    card.querySelector(".approve").addEventListener("click", () => respondApproval(approval.id, true, card));
-    card.querySelector(".deny").addEventListener("click", () => respondApproval(approval.id, false, card));
-    $("#agent-transcript").appendChild(card);
-    $("#agent-transcript").scrollTop = $("#agent-transcript").scrollHeight;
+    state.pendingApproval = approval;
+    renderAgentTranscript();
   }
 
   async function respondApproval(id, approved, card) {
+    const buttons = [...card.querySelectorAll("button")];
+    buttons.forEach((button) => { button.disabled = true; });
     try {
       await state.rpc.request("approval.respond", { approval_id: id, approved }).promise;
-      card.remove();
+      if (state.pendingApproval?.id === id) {
+        state.pendingApproval = null;
+        renderAgentTranscript();
+      }
       addActivity("approval", approved ? "已允许操作" : "已拒绝操作", "Agent 将继续处理当前任务");
       setAgentStatus("running", "继续工作");
     } catch (error) {
+      buttons.forEach((button) => { button.disabled = false; });
       toast(`审批失败：${error.message}`);
     }
   }
@@ -1022,6 +1078,8 @@
     state.agentSessionId = state.inspectedSessionId;
     state.agentSnapshot = JSON.parse(JSON.stringify(state.inspectedSnapshot));
     state.activities = [];
+    state.pendingApproval = null;
+    state.agentFollowBottom = true;
     state.thinkingFinished = false;
     renderAgentTranscript();
     renderActivities();
@@ -1038,7 +1096,11 @@
 
   function switchView(view) {
     state.activeView = view;
-    $$("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+    $$("[data-view]").forEach((button) => {
+      const active = button.dataset.view === view;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-current", active ? "page" : "false");
+    });
     $$(".view").forEach((panel) => panel.classList.toggle("is-active", panel.id === `${view}-view`));
     if (view === "sessions") {
       renderSessions();
@@ -1198,8 +1260,15 @@
   function bindStarterButtons() {
     $$('[data-starter]').forEach((button) => button.addEventListener("click", () => {
       $("#prompt").value = button.dataset.starter;
+      resizePrompt();
       $("#prompt").focus();
     }));
+  }
+  function resizePrompt() {
+    const prompt = $("#prompt");
+    prompt.style.height = "auto";
+    prompt.style.height = `${Math.min(Math.max(prompt.scrollHeight, 88), 220)}px`;
+    $("#prompt-count").textContent = `${prompt.value.length} 字`;
   }
   function shortId(value = "", max = 22) {
     if (value.length <= max) return value;
@@ -1237,6 +1306,7 @@
   }
 
   $("#composer").addEventListener("submit", sendPrompt);
+  $("#prompt").addEventListener("input", resizePrompt);
   $("#prompt").addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendPrompt(event);
   });
@@ -1279,6 +1349,9 @@
     $("#settings-dialog").close();
     connect();
   });
+  $("#retry-connection").addEventListener("click", () => connect().catch((error) => toast(error.message)));
+  $("#agent-transcript").addEventListener("scroll", () => updateLatestButton());
+  $("#jump-latest").addEventListener("click", scrollAgentToLatest);
   $$(".trace-filter button").forEach((button) => button.addEventListener("click", () => {
     state.traceFilter = button.dataset.filter;
     $$(".trace-filter button").forEach((item) => item.classList.toggle("active", item === button));
@@ -1286,5 +1359,7 @@
   }));
 
   bindStarterButtons();
+  resizePrompt();
+  switchView("agent");
   bootstrap();
 })();

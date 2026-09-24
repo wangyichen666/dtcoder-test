@@ -438,6 +438,8 @@ impl ToolCallStreamError {
 pub enum ProviderEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// Provider 因输出 token 上限截断了本轮响应。
+    OutputTruncated,
     ToolCallStarted {
         exec_id: ExecutionIdentity,
         name: String,

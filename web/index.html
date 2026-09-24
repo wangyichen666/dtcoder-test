@@ -19,14 +19,15 @@
         </div>
 
         <nav class="primary-nav" aria-label="主要功能">
-          <button class="active" data-view="agent" type="button">Agent 工作台</button>
-          <button data-view="sessions" type="button">Session 查看</button>
+          <button class="active" data-view="agent" aria-current="page" type="button">Agent 工作台</button>
+          <button data-view="sessions" aria-current="false" type="button">Session 查看</button>
         </nav>
 
         <div class="topbar-actions">
           <button id="new-agent-session" class="primary-button compact topbar-new-task" type="button">＋ 新建任务</button>
           <span id="connection" class="connection is-connecting"><i></i><span>正在连接 daemon</span></span>
-          <button id="settings" class="icon-button" type="button" title="连接设置">•••</button>
+          <button id="settings" class="icon-button settings-button" type="button" title="连接设置" aria-label="打开连接和模型设置">⚙ <span>设置</span></button>
+          <button id="retry-connection" class="quiet-button compact retry-button hidden" type="button">重试连接</button>
         </div>
       </header>
 
@@ -56,9 +57,10 @@
                   </div>
                 </div>
               </div>
+              <button id="jump-latest" class="jump-latest hidden" type="button">↓ 回到最新</button>
 
               <form id="composer" class="composer">
-                <textarea id="prompt" rows="3" placeholder="描述你希望 Agent 在当前工作目录完成的任务…" disabled></textarea>
+                <textarea id="prompt" rows="3" aria-label="给 Agent 的任务描述" aria-describedby="prompt-hint" placeholder="描述你希望 Agent 在当前工作目录完成的任务…" disabled></textarea>
                 <div class="composer-footer">
                   <div class="composer-context">
                     <button id="workspace-trigger" class="workspace-trigger" type="button" title="切换 Agent 工作目录">
@@ -73,7 +75,7 @@
                     </button>
                   </div>
                   <div class="composer-actions">
-                    <span><kbd>⌘</kbd><kbd>Enter</kbd> 发送</span>
+                    <span id="prompt-hint"><kbd>⌘</kbd><kbd>Enter</kbd> 发送 · <span id="prompt-count">0 字</span></span>
                     <button id="send" class="send-button" type="submit" disabled>交给 Agent <span>↗</span></button>
                   </div>
                 </div>
@@ -86,7 +88,7 @@
                   <span class="eyebrow">Live execution</span>
                   <h2>Agent 动态</h2>
                 </div>
-                <span id="agent-status" class="status-pill">空闲</span>
+                <span id="agent-status" class="status-pill" role="status" aria-live="polite">空闲</span>
               </div>
               <div class="workspace-card">
                 <span>当前工作目录</span>

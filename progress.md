@@ -289,3 +289,56 @@
 - [x] TUI `/models` 列表与切换：支持编号和配置 ID。
 - [x] 全量回归：143/143 测试、严格 Clippy、格式/JS 语法检查、release 构建和 `cargo install --path . --force` 通过。
 - [x] Web 模型保存/激活优先走 daemon 原子 RPC；活动 turn 期间返回冲突，不会出现全局配置已变而当前 daemon 未切换的不一致状态。
+
+# 2026-09-13 参考 pi 的 TUI 与 Agent 架构优化
+
+- [x] 已读取 `planning-with-files` 技能并复用仓库既有规划体系。
+- [x] 已读取 pi 根级 `AGENTS.md`，确认本轮只读 pi 且宽泛改动前完整阅读目标文件。
+- [x] 已恢复误覆盖的长期规划记录；恢复后 `git status --short` 为空。
+- [ ] 当前阶段 0：建立两项目 TUI、Agent 运行流程、测试与模块边界基线。
+- [x] 已盘点 pi 的 `tui`、`agent`、`coding-agent` 关键文件与规模，并确认与当前 Rust 技术栈的映射边界。
+- [x] 已完整覆盖当前 `src/entry/tui.rs`（对截断区间另行读取），记录事件泵、状态耦合、快捷键和已有能力基线。
+- [x] 已完整阅读当前 `src/entry/tui/view.rs`，记录布局、渲染缓存、长会话分配热点和帮助/快捷键双真相问题。
+- [x] 已完整阅读 `input_editor.rs` 与 `loop_engine.rs`，建立输入能力、Agent 生命周期、工具调度、取消与持久化基线。
+- [x] 已完整阅读 pi 的 keybinding、ScrollView、EditorComponent、Input、UndoStack、KillRing 与 word-navigation 相关实现。
+- [x] 已完整阅读 pi `packages/tui/src/tui.ts`，确认失效合并、输入即时渲染、焦点/overlay 和底层终端职责边界。
+- [x] 已阅读 pi main-screen 全文、alt-screen 前半及 coding-agent 的 viewport/renderer 组合根，区分可迁移交互与不应重复实现的底层 ANSI renderer。
+- [x] 已完整阅读 pi alt-screen 后半，并开始完整阅读 `packages/agent/src/agent-loop.ts`；已确认事件生命周期、steering/follow-up 和截断工具调用策略差异。
+- [x] 已完整阅读 pi `agent-loop.ts` 与 `types.ts`，完成工具生命周期、事件契约、partial state 与恢复元数据对照。
+- [x] 已确认当前 Provider 停止原因完全丢失，锁定“截断工具调用整批拒绝”为 Agent 流程候选优化。
+- [x] 已完整阅读 `tool_calls.rs` 与 OpenAI/Anthropic/Ollama provider 流解析，形成统一截断事件的最小兼容方案。
+- [x] pi Agent wrapper/session runtime 与 stop-reason 映射对照完成；基线全量测试 143/143 通过。
+- [x] 阶段 0 完成，已选定 TUI keymap、grapheme、安全聚合运行态、非阻塞 stream poll 和截断工具 fail-closed 五项改进。
+- [x] 已确认 grapheme 实现可复用锁文件中的 `unicode-segmentation 1.13.3`。
+- [x] `InputEditor` 已改为 UTF-8 字符串 + grapheme 边界光标，组合字符与 ZWJ emoji 删除回归通过（3/3）。
+- [x] 集中 `TuiAction` keymap 已接通，处理逻辑与帮助文案共享定义；增加 Alt+方向、Ctrl+J、Ctrl+D 等 pi 风格兼容键，TUI 定向测试 24/24 通过。
+- [x] per-turn phase 与非阻塞/公平轮询 RPC poll 已实现；审批、工具、流式、等待按事实集合聚合，TUI 定向测试 25/25 通过。
+- [x] 三 Provider 已统一输出截断事件，assembler 对含工具的截断响应 fail-closed、纯文本保持兼容；tool_calls 5/5、provider 21/21 定向测试通过。
+- [x] 新增 LoopEngine 端到端回归：截断但 JSON 合法的副作用工具调用执行次数为 0，系统回填 `output_truncated` 后模型可安全重试并完成。
+- [x] 已完成 `cargo fmt --all` 与 `git diff --check`；一次合并差异输出因体量过大被截断，后续改为按文件聚焦审阅。
+- [x] 聚焦复核修正恢复订阅失败时残留 `Recovering` phase 的问题，并保留可见失败计数；keymap 兼容带 Shift 的字符型控制键，帮助补回斜杠命令入口。
+- [ ] 定向回归首次误加 `--lib`，而项目是纯 binary crate；格式化已完成，测试参数待按实际 target 重跑。
+- [x] 去掉错误 target 参数后 TUI 定向测试 25/25 通过；Provider/assembler/LoopEngine 截断差异复核未发现重复组装或绕过统一重试链路。
+- [x] 输入编辑器二次边界审阅发现插入 ZWJ 可能合并光标两侧字素，已增加向前吸附不变量与相邻 emoji 回归。
+- [x] 字素不变量修复后 TUI 定向测试 26/26 通过；依赖锁定、ProviderEvent 全部使用点与工作树差异检查完成，`git diff --check` 通过。
+- [x] 复核 Provider 事件消费确认 `OutputTruncated` 统一经过 `ToolCallAssembler`，不会绕过现有 ToolAssemblyFailed 重试；README/HTML 现有 TUI 文档已定位，待同步字素与新增快捷键。
+- [x] README 与系统总览已同步 action keymap、pi 风格编辑别名、字素安全和并发 phase 聚合；模块说明标出独立 keymap 边界。
+- [x] 多 Provider 文档已同步 token 上限截断工具批次 fail-closed 语义。
+- [x] 全量质量门通过：fmt check、all-targets check、严格 Clippy、153/153 测试、release 构建与 diff check 全绿。
+- [x] TestBackend 已覆盖 110×42、44×30、24×12、16×8 及审批态；仓库没有 JSON→PNG 脚本，本轮不引入一次性渲染工具。
+- [x] 字素吸附在输入末尾走 O(1) 快路径，仅中部插入时扫描新边界，避免长提示逐字输入退化。
+- [x] O(1) 末尾输入快路径加入后重新跑完整质量门：153/153、严格 Clippy、all-targets check、fmt、release 与 diff check 全绿；pi 参考仓库保持干净未修改。
+- [x] findings 已补齐实施结果、结构取舍与四项后续演进建议；本轮阶段全部完成。
+
+# 2026-09-13 Web 前端体验优化
+
+- [x] 已读取 planning-with-files 技能，并确认保留前一轮未提交源码改动。
+- [x] 已完成 Web HTML/CSS/JS 基线扫描：现有工作台已具备 Agent、Session、模型、权限和目录能力，本轮聚焦层次、反馈、可访问性与响应式细节。
+- [x] 进一步确认三处体验缺口：流式重绘会强制滚到底部、审批卡只存在于当前 DOM、输入框没有自适应高度/明确的键盘提示；将优先修正并补充轻量视觉层次。
+- [x] 本地静态浏览器复核基线完成：默认窄视口下页面层次清楚，但顶部操作区偏轻、连接失败缺少可操作恢复入口，composer 需要更强的聚焦/状态反馈；准备按状态持久化、滚动保持和输入体验三条线实施。
+- [x] 第一轮 HTML/CSS/JS 改动已完成：新增连接重试、stateful 审批卡、滚动跟随/回到底部、textarea 自适应、字数提示、焦点轮廓、状态脉冲和 reduced-motion 支持。
+- [x] IAB 窄屏回归已确认：重试连接与设置入口可见、composer 字数提示可读、页面无明显横向溢出。
+- [x] JS 静态语法检查通过；复核并修正审批内容拼接的运算优先级，确保已有消息时审批卡仍会显示。
+- [x] 全量门禁通过：`node --check web/app.js`、fmt、all-targets check、严格 Clippy、153/153 测试、release 构建与 diff check 全绿。
+- [x] 浏览器回归通过：控制台无 error/warning；窄屏 684px 下 `scrollWidth=684` 无横向溢出，重试入口可见，输入框初始高度自适应。
+- [x] 已将 Web 前端改动与取舍写入 `findings.md`；后续可继续做真实 daemon 流式/审批浏览器回归，但当前静态交互和编译链已验收。
