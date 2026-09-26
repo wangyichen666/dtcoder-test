@@ -75,7 +75,7 @@
                     </button>
                   </div>
                   <div class="composer-actions">
-                    <span id="prompt-hint"><kbd>⌘</kbd><kbd>Enter</kbd> 发送 · <span id="prompt-count">0 字</span></span>
+                    <span id="prompt-hint"><kbd id="send-modifier">Ctrl</kbd><kbd>Enter</kbd> 发送 · <span id="prompt-count">0 字</span></span>
                     <button id="send" class="send-button" type="submit" disabled>交给 Agent <span>↗</span></button>
                   </div>
                 </div>
@@ -129,7 +129,7 @@
               <div class="session-workspace" id="session-workspace">当前工作区</div>
               <label class="search-box">
                 <span>⌕</span>
-                <input id="session-search" type="search" placeholder="搜索 Session 或任务内容" />
+                <input id="session-search" type="search" aria-label="搜索 Session 或任务内容" placeholder="搜索 Session 或任务内容" />
               </label>
               <div class="session-toolbar">
                 <span><i class="dot running"></i>运行中</span>
@@ -174,11 +174,11 @@
                 <div><strong>—</strong><span>工具调用</span></div>
                 <div><strong>—</strong><span>总耗时</span></div>
               </div>
-              <div class="trace-filter" role="tablist">
-                <button class="active" data-filter="all" type="button">全部</button>
-                <button data-filter="model" type="button">LM</button>
-                <button data-filter="tool" type="button">工具</button>
-                <button data-filter="turn" type="button">Turn</button>
+              <div class="trace-filter" role="group" aria-label="链路类型筛选">
+                <button class="active" data-filter="all" type="button" aria-pressed="true">全部</button>
+                <button data-filter="model" type="button" aria-pressed="false">LM</button>
+                <button data-filter="tool" type="button" aria-pressed="false">工具</button>
+                <button data-filter="turn" type="button" aria-pressed="false">Turn</button>
               </div>
               <div id="trace-list" class="trace-list">
                 <div class="trace-empty">选择 Session 后显示完整执行链路。</div>
@@ -267,14 +267,14 @@
           API Token
           <input id="token" type="password" autocomplete="off" placeholder="仅非回环绑定时需要" />
         </label>
-        <p>Token 只保存在当前浏览器的 localStorage，不会写入 Session。</p>
+        <p>Token 优先保存在当前浏览器；若浏览器禁止存储，仅在本页关闭前有效。不会写入 Session。</p>
         <div class="settings-divider"></div>
         <div class="model-settings-heading">
           <div>
             <h3>模型配置</h3>
             <p>保存一次后，所有终端和工作区都可以复用。API key 只写入本机私有配置文件。</p>
           </div>
-          <button id="refresh-models" class="quiet-button" type="button">刷新</button>
+          <div class="model-heading-actions"><button id="new-model-profile" class="quiet-button" type="button">新建配置</button><button id="refresh-models" class="quiet-button" type="button">刷新</button></div>
         </div>
         <div id="model-profile-list" class="model-profile-list">
           <div class="directory-empty">正在读取模型配置…</div>

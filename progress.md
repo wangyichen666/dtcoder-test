@@ -357,3 +357,12 @@
 - [x] 新增 16 项 Web 交互回归；前端语法检查、Rust 200 项测试、fmt、严格 Clippy 和 diff check 均通过。
 - [x] 使用进程级 Ollama 占位环境完成本机浏览器连接及历史 Session 冒烟验证，未改全局模型配置，已关闭临时服务。
 - [x] Release 构建与最终差异复核通过；本轮改动已提交并推送。
+
+# 2026-09-26：再修复 50 项
+
+- [x] 读取本轮规划技能和 Git 基线；`main` 与 `origin/main` 一致，工作树干净。
+- [x] 形成 50 项有触发路径的独立问题清单，见 `findings.md` 本轮表格。
+- [x] 分批修复 50 项，按编号记录修复与验证映射；Web 回归从 16 项扩至 26 项，Rust 新增订阅失效回归。
+- [x] 浏览器冒烟：独立端口成功打开项目工作区、Session 历史和模型设置；编辑后“新建配置”清空旧 ID。临时服务与页面已关闭。
+- [x] 全量门禁：`node --check web/app.js`、Web 26/26、`cargo fmt --all -- --check`、严格 Clippy、Rust 201/201、`cargo build --release`、`git diff --check` 均通过。
+- [x] 本轮全部变更提交并推送到 `origin/main`。

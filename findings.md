@@ -675,3 +675,76 @@
 - 19–20：CLI 单次聊天错误打印后继续 REPL；TUI 任务已提交后队列查询失败只提示队列状态不可用，不再把任务判为操作失败。通过 Rust 全量测试与严格 Clippy 验证编译和现有契约。
 - 本机真实浏览器复核：在仅用于进程的 Ollama 占位配置下，Web 工作台成功连接并读取历史 Session，输入可用；初始无模型配置时仍会清楚显示连接失败和重试入口。测试后已关闭临时服务、浏览器页并请求 daemon 停止。未运行真实模型推理或外部 Provider。
 - 验证：`node --test web/app.test.cjs` 16/16；`node --check web/app.js`；`cargo fmt --all -- --check`；`cargo clippy --all-targets --all-features -- -D warnings`；`cargo test --all-targets` 200/200；`cargo build --release`；`git diff --check` 全部通过。
+
+## 2026-09-26：再次审计 50 项
+
+- 基线：`main` 工作树干净；上一轮 20 项已提交。此轮从未覆盖的路径重新审计，避免重复记数。
+- 下表逐项给出触发路径与源码位置；修复按路径归组，验证记录见表后。
+
+### 已确认的 50 项独立问题（本轮）
+
+| # | 触发与当前表现 | 位置 |
+|---:|---|---|
+| 1 | 自动重连倒计时期间无法手动立即重试 | `web/app.js:setConnection` |
+| 2 | 恢复快照读取失败后输入长期锁定 | `recoverAgentTurn` |
+| 3 | 同一 Session 多个活动任务时恢复长期锁定 | `recoverAgentTurn` |
+| 4 | 已知 run 与唯一活动请求不匹配时误订阅别人的任务 | `recoverAgentTurn` |
+| 5 | 断线后失败或取消的 run 都显示成泛泛的“已结束” | `recoverAgentTurn` |
+| 6 | 断线后终态快照只取最早 60 条，末尾结果可能不可见 | `recoverAgentTurn` |
+| 7 | 订阅返回 `subscribed:false` 时显示“待确认”，却放开输入 | `recoverAgentTurn` |
+| 8 | 并发恢复入口可能对同一 run 发起两个订阅 | `connect` / `sendPrompt` |
+| 9 | 恢复时多个待审批项只显示第一项 | `recoverAgentTurn` |
+| 10 | WebSocket 断开后审批按钮仍可点击并报 RPC 错误 | `setAgentControls` / `renderApprovalCard` |
+| 11 | 正常打开长 Agent 会话也只显示最早 60 条 | `loadAgentSession` |
+| 12 | 从 Session 查看继续会话时复制分页片段，误称完整记录 | `continueInspectedSession` |
+| 13 | 每次切回 Session 页都会重新读取并清除已翻页内容 | `switchView` |
+| 14 | 同一 Session 连续检查时旧请求仍可覆盖新请求 | `inspectSession` |
+| 15 | 切换 Session 后旧对话仍显示在“正在读取”标题下 | `inspectSession` |
+| 16 | 切换 Session 后旧链路仍显示在新 Session 标题下 | `inspectSession` |
+| 17 | 链路摘要以已加载页统计，却看起来是全部记录 | `renderTrace` |
+| 18 | 链路筛选或加载更多会折叠已展开的记录 | `renderTrace` |
+| 19 | 搜索后数量徽标仍显示全部 Session 数量 | `renderSessions` |
+| 20 | 缺失时间戳的会话被错误归类为“今天” | `sessionDayKey` |
+| 21 | 快速连点“新建任务”可产生多个 Session | `newAgentSession` |
+| 22 | Agent 运行时输入框不可编辑，不能预写下一条任务 | `setAgentControls` |
+| 23 | 非 macOS 页面仍提示 `⌘ Enter`，与实际 Ctrl 快捷键不符 | `web/index.html` |
+| 24 | 中文输入法组合期间按发送快捷键会意外提交 | `web/app.js` 键盘事件 |
+| 25 | 链路筛选按钮只有颜色变化，没有可读选中状态 | `web/index.html` / 筛选事件 |
+| 26 | 当前 Session 列表项只有视觉高亮，没有选中语义 | `renderSessionItem` |
+| 27 | 运行/审批状态图标只有颜色，没有会话级文字 | `renderSessionItem` |
+| 28 | Session 搜索仅靠 placeholder，缺少控件名称 | `web/index.html` |
+| 29 | 非法链路时间戳让 `Intl.DateTimeFormat` 抛异常 | `formatTime` |
+| 30 | “几分钟前”只在整页重绘时更新 | `renderSessionItem` |
+| 31 | 快速连续激活模型时，较早响应可覆盖后一次选择 | `useModelProfile` |
+| 32 | 保存模型成功后 API key 仍留在输入 DOM 中 | `saveModelProfile` |
+| 33 | 模型列表刷新失败会清空先前已读的可用配置 | `loadModels` |
+| 34 | 权限模式刷新失败会清空先前已知状态 | `loadPermissionMode` |
+| 35 | 权限切换响应晚于工作区切换时污染新工作区状态 | `selectPermissionMode` |
+| 36 | 选择当前权限模式会静默返回且对话框不关闭 | `selectPermissionMode` |
+| 37 | 打开权限对话框后任务开始，点选模式静默无反馈 | `selectPermissionMode` |
+| 38 | 浏览器禁用 localStorage 时保存 Token 抛异常，无法重连 | `#reconnect` 事件 |
+| 39 | 编辑配置后缺少“新增配置”入口，旧 ID 容易被覆盖 | 模型设置对话框 |
+| 40 | 无效或负数耗时会在界面显示 `NaN`/负值 | `formatDuration` |
+| 41 | 目录读取失败后仍保留上次可选择的旧路径 | `browseDirectory` |
+| 42 | 手动输入新路径后直接点“选择”实际选择旧目录 | `selectBrowsedWorkspace` |
+| 43 | 切换工作区后 Session 标题和对话仍显示旧目录内容 | `resetWorkspaceState` |
+| 44 | 新工作区继承旧工作区搜索条件，容易误以为无会话 | `resetWorkspaceState` |
+| 45 | 新工作区继承旧目录折叠状态，可能隐藏全部 Session | `resetWorkspaceState` |
+| 46 | 新工作区继承链路过滤条件，可能隐藏记录 | `resetWorkspaceState` |
+| 47 | CLI `/` 命令单次失败会退出整个 REPL | `src/entry/cli.rs:run_repl` |
+| 48 | TUI 提交失败时输入已从编辑器取走且不可重试 | `src/entry/tui.rs:handle_key` |
+| 49 | CLI 取消 RPC 返回 `cancelled:false` 仍打印“正在取消” | `src/entry/cli.rs:cancel_request` |
+| 50 | TUI 流意外关闭只要求退出重开，不尝试恢复订阅 | `src/entry/tui.rs:run_event_loop` |
+
+### 修复与验证映射
+
+| 编号 | 修复与验证 |
+|---|---|
+| 1–10 | 重连期间保留立即重试；恢复读取异常与歧义任务均释放输入锁；按稳定 run 核对 request 身份、终态和消息末页；订阅失效明确报错；同一 RPC 避免重复恢复；审批队列逐项显示且断线禁用。Web 回归覆盖快照失败、run 不匹配、重复恢复及多审批。 |
+| 11–20 | Agent 默认载入最新消息页；继续会话时重新读取末页；历史页保留分页；同 ID 并发检查用代次淘汰旧响应；切换时清旧消息与链路；部分摘要标注范围；详情展开状态跨筛选保留；搜索计数、未知日期与相对时间显示修正。Web 回归覆盖长会话与并发检查。 |
+| 21–30 | 新建 Session 加提交锁，运行时允许准备下条输入；快捷键标识按平台更新并跳过输入法组合；筛选与 Session 选中补语义，状态补文字、搜索补名称；无效时间戳不抛异常。Web 回归覆盖重复新建；浏览器实测 Agent 与 Session 页面。 |
+| 31–40 | 模型激活串行化；保存后清空密钥；刷新失败保留已知模型和权限；权限响应按 RPC 身份检查，并对相同模式和忙碌状态给反馈；Token 在禁用存储时保留页内值；新增空白配置入口；异常耗时显示占位。Web 回归覆盖激活顺序、耗时，浏览器实测配置入口与清空行为。 |
+| 41–46 | 目录失败时失效旧选中路径；手输路径选择前先核实；切换工作区时清除旧标题、对话、搜索、折叠和链路筛选。Web 回归覆盖失败目录及工作区状态清理。 |
+| 47–50 | CLI 单次斜杠命令失败留在 REPL，取消结果为 false 时报告失败；TUI 提交失败恢复草稿与原会话显示，任务流断开有限重新订阅。Rust 新增订阅失效不可误报完成回归，既有 daemon 断流重连测试继续通过。 |
+
+完整门禁与提交信息见 `progress.md` 本轮记录。浏览器冒烟使用独立端口和临时 Ollama 环境配置，未触发模型推理；结束后关闭临时服务与页面。

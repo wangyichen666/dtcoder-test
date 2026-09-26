@@ -263,6 +263,7 @@ kbd { padding: 2px 4px; margin-right: 2px; border: 1px solid var(--line); border
 .session-item.active { background: var(--teal-soft); border-color: rgba(13,102,91,.18); }
 .session-row { display: flex; align-items: center; gap: 8px; }
 .session-row strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 650 11px ui-monospace, monospace; }
+.session-status { flex: none; color: var(--muted); font-size: 10px; }
 .session-item p { margin: 8px 0 7px 15px; color: #4e5a55; font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .session-item small { margin-left: 15px; color: var(--muted); font-size: 10px; }
 
@@ -303,6 +304,7 @@ dialog::backdrop { background: rgba(21,31,28,.32); backdrop-filter: blur(5px); }
 .settings-card select { padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; outline: 0; background: var(--white); color: var(--ink); }
 .settings-divider { height: 1px; margin: 22px 0 18px; background: var(--line); }
 .model-settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.model-heading-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .model-settings-heading h3 { margin: 0; font-size: 15px; }
 .model-settings-heading p { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .model-profile-list { display: grid; gap: 7px; max-height: 170px; overflow: auto; margin: 13px 0 12px; }

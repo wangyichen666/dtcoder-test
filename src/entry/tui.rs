@@ -80,6 +80,7 @@ struct UiToolCall {
 struct ActiveTurn {
     request_id: RequestId,
     stream: RpcStream,
+    recovery_attempts: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -545,7 +546,11 @@ pub async fn run_tui(client: DaemonClient, workspace: &std::path::Path) -> Resul
     let mut recovery_failures = 0_usize;
     for request_id in std::mem::take(&mut state.recovery_active_requests) {
         match recovery::subscribe_for_session(&client, &request_id, &session_id).await {
-            Ok(stream) => state.active_turns.push(ActiveTurn { request_id, stream }),
+            Ok(stream) => state.active_turns.push(ActiveTurn {
+                request_id,
+                stream,
+                recovery_attempts: 0,
+            }),
             Err(_) => {
                 state.turn_phases.remove(&request_id);
                 recovery_failures += 1;
@@ -699,10 +704,38 @@ async fn run_event_loop(
                     }
                 }
                 Some(None) => {
-                    state.active_turns.remove(index);
-                    state.turn_phases.remove(&request_id);
+                    let interrupted = state.active_turns.remove(index);
                     idle_checks = 0;
-                    state.status = "连接中断 · 退出后重新运行 myagent 可恢复".to_owned();
+                    let attempts = interrupted.recovery_attempts + 1;
+                    if attempts <= 3 {
+                        state.set_turn_phase(&request_id, ActivityPhase::Recovering);
+                        match recovery::subscribe_for_session(
+                            client,
+                            &request_id,
+                            &state.session_id,
+                        )
+                        .await
+                        {
+                            Ok(stream) => {
+                                state.active_turns.push(ActiveTurn {
+                                    request_id,
+                                    stream,
+                                    recovery_attempts: attempts,
+                                });
+                                state.status =
+                                    format!("连接中断，已重新订阅任务（第 {attempts}/3 次）");
+                            }
+                            Err(error) => {
+                                state.turn_phases.remove(&request_id);
+                                state.status = format!(
+                                    "恢复任务失败：{error:#} · 可通过 /resume 恢复 Session"
+                                );
+                            }
+                        }
+                    } else {
+                        state.turn_phases.remove(&request_id);
+                        state.status = "任务流多次中断 · 可通过 /resume 恢复 Session".to_owned();
+                    }
                     dirty = true;
                 }
                 None => {
@@ -891,8 +924,11 @@ async fn handle_key(client: &DaemonClient, state: &mut TuiState, key: KeyEvent) 
         }
         Some(TuiAction::Submit) if !state.input.is_blank() => {
             let message = state.input.take();
+            if let Err(error) = submit_input(client, state, message.clone()).await {
+                state.input.replace(&message);
+                return Err(error);
+            }
             state.record_history(&message);
-            submit_input(client, state, message).await?;
         }
         None if let KeyCode::Char(character) = key.code
             && !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -990,6 +1026,18 @@ async fn handle_frame(state: &mut TuiState, turn_id: &RequestId, frame: ServerFr
                     Some(turn_id.clone()),
                 );
                 state.status = format!("请求失败（{}）：{}", error.code, error.message);
+            } else if response
+                .result
+                .as_ref()
+                .and_then(|result| result["subscribed"].as_bool())
+                == Some(false)
+            {
+                state.push_text_for_turn(
+                    Role::System,
+                    format!("✗ 执行体不可用 · request={turn_id:?} · 请查看 Session 记录"),
+                    Some(turn_id.clone()),
+                );
+                state.status = format!("执行体不可用 · request={turn_id:?}");
             } else {
                 state.push_text_for_turn(
                     Role::System,
@@ -1016,7 +1064,6 @@ async fn submit_input(client: &DaemonClient, state: &mut TuiState, message: Stri
     }
 
     state.resume_choices.clear();
-    state.push_user(message.clone());
     begin_turn(client, state, message).await
 }
 
@@ -1028,9 +1075,14 @@ async fn begin_turn(client: &DaemonClient, state: &mut TuiState, message: String
         )
         .await?;
     let request_id = stream.request_id().clone();
+    state.push_user(message);
     let request_label = format!("{request_id:?}");
     state.set_turn_phase(&request_id, ActivityPhase::WaitingModel);
-    state.active_turns.push(ActiveTurn { request_id, stream });
+    state.active_turns.push(ActiveTurn {
+        request_id,
+        stream,
+        recovery_attempts: 0,
+    });
     let queued = crate::entry::cli::request_result(
         client,
         "queue.list",
@@ -1371,6 +1423,34 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message_text(message).contains("任务完成"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_subscription_does_not_claim_turn_completed() {
+        let request_id = RequestId::String("turn-missing".to_owned());
+        let mut state = TuiState::from_snapshot(recovery::RecoverySnapshot {
+            session_id: "test".to_owned(),
+            messages: Vec::new(),
+            pending_approvals: Vec::new(),
+            active_requests: Vec::new(),
+        });
+        handle_frame(
+            &mut state,
+            &request_id,
+            ServerFrame::Response(JsonRpcResponse::success(
+                request_id.clone(),
+                json!({"subscribed": false}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(state.status.contains("执行体不可用"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .all(|message| !message_text(message).contains("任务完成"))
         );
     }
 

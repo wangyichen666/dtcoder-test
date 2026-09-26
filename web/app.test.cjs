@@ -10,7 +10,9 @@ assert.ok(entry > 0, "前端测试入口存在");
 const harness = `${source.slice(0, entry)}
   globalThis.__appTest = { state, RpcSocket, connect, sendPrompt, recoverAgentTurn,
     renderTranscript, updateLatestButton, resizePrompt, inspectSession, refreshSessions,
-    cancelTurn, useModelProfile, saveModelProfile, browseDirectory };
+    cancelTurn, useModelProfile, saveModelProfile, browseDirectory, selectBrowsedWorkspace,
+    loadLatestAgentSnapshot, loadModels, resetWorkspaceState, formatDuration,
+    renderAgentTranscript, newAgentSession };
 })();`;
 
 function createHarness() {
@@ -348,4 +350,173 @@ test("旧 Session 的读取错误不覆盖新 Session", async () => {
   await older;
   assert.equal(app.state.inspectedSessionId, "new");
   assert.doesNotMatch(app.element("#toast").textContent, /旧请求失败/);
+});
+
+test("长会话打开时读取末尾页", async () => {
+  const app = createHarness();
+  const offsets = [];
+  const rpc = { request(method, params) {
+    assert.equal(method, "session.load_page");
+    offsets.push(params.offset);
+    return { promise: Promise.resolve({ total_messages: 130, messages: [{ role: "assistant", content: String(params.offset) }] }) };
+  } };
+  const page = await app.loadLatestAgentSnapshot(rpc, "long");
+  assert.deepEqual(offsets, [0, 70]);
+  assert.equal(page.messages[0].content, "70");
+});
+
+test("恢复快照失败后释放输入锁", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  app.state.agentSessionId = "one";
+  app.state.activeRequest = "reconnecting";
+  app.state.rpc = { request() { return { promise: Promise.reject(new Error("读取失败")) }; } };
+  await app.recoverAgentTurn();
+  assert.equal(app.state.activeRequest, null);
+  assert.equal(app.element("#agent-status").textContent, "恢复失败");
+});
+
+test("已知 run 不匹配时不订阅其他任务", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  app.state.agentSessionId = "one";
+  app.state.activeRequest = "reconnecting";
+  app.state.activeRunId = "run-one";
+  const methods = [];
+  app.state.rpc = { request(method) {
+    methods.push(method);
+    if (method === "session.load_page") return { promise: Promise.resolve({ messages: [], active_requests: [2] }) };
+    if (method === "run.read") return { promise: Promise.resolve({ status: "failed", request_id: 1, error_message: "执行失败" }) };
+    throw new Error(`不应订阅 ${method}`);
+  } };
+  await app.recoverAgentTurn();
+  assert.equal(methods.includes("agent.subscribe"), false);
+  assert.equal(app.element("#agent-status").textContent, "失败");
+  assert.equal(app.state.activeRequest, null);
+});
+
+test("同一 Session 的较早检查响应不能覆盖新检查", async () => {
+  const app = createHarness();
+  const pending = [];
+  app.state.rpc = { request(method) {
+    const entry = { method };
+    entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+    pending.push(entry);
+    return { promise: entry.promise };
+  } };
+  const old = app.inspectSession("same", false);
+  const fresh = app.inspectSession("same", false);
+  pending[2].resolve({ messages: [{ role: "assistant", content: "新响应" }], total_messages: 1 });
+  pending[3].resolve({ records: [], total_records: 0 });
+  await fresh;
+  pending[0].resolve({ messages: [{ role: "assistant", content: "旧响应" }], total_messages: 1 });
+  pending[1].resolve({ records: [], total_records: 0 });
+  await old;
+  assert.equal(app.state.inspectedSnapshot.messages[0].content, "新响应");
+});
+
+test("模型切换按用户点击顺序提交", async () => {
+  const app = createHarness();
+  const activated = [];
+  app.context.fetch = async (path, options) => {
+    if (path === "/api/models/activate") {
+      const id = JSON.parse(options.body).profile_id;
+      activated.push(id);
+      return { ok: true, json: async () => ({ active_id: id, profile: { name: id } }) };
+    }
+    return { ok: true, json: async () => ({ profiles: [], active_id: activated.at(-1) }) };
+  };
+  await Promise.all([app.useModelProfile("first"), app.useModelProfile("second")]);
+  assert.deepEqual(activated, ["first", "second"]);
+  assert.equal(app.state.activeModelId, "second");
+});
+
+test("目录读取失败清空旧路径，手动输入路径先验证", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  app.state.workspace = "/current";
+  app.state.browsePath = "/old";
+  app.context.fetch = async () => ({ ok: false, status: 404, json: async () => ({ error: { message: "无此目录" } }) });
+  await assert.rejects(app.browseDirectory("/missing"), /无此目录/);
+  assert.equal(app.state.browsePath, null);
+  app.element("#browse-path").value = "/missing";
+  await app.selectBrowsedWorkspace();
+  assert.equal(app.state.workspace, "/current");
+  assert.equal(app.state.browsePath, null);
+});
+
+test("切换工作区清除旧搜索和详情，耗时异常值显示占位", () => {
+  const app = createHarness();
+  app.state.collapsedDays.add("2026-09-25");
+  app.state.traceFilter = "tool";
+  app.state.inspectedSessionId = "old";
+  app.element("#session-search").value = "旧任务";
+  app.element("#session-title").textContent = "旧会话";
+  app.resetWorkspaceState();
+  assert.equal(app.element("#session-search").value, "");
+  assert.equal(app.element("#session-title").textContent, "选择一个 Session");
+  assert.equal(app.state.traceFilter, "all");
+  assert.equal(app.state.collapsedDays.size, 0);
+  assert.equal(app.formatDuration(NaN), "—");
+  assert.equal(app.formatDuration(-1), "—");
+});
+
+test("恢复时显示所有待审批项", () => {
+  const app = createHarness();
+  app.state.agentSnapshot = { messages: [] };
+  app.state.pendingApprovals = [
+    { id: "a", prompt: "允许 A" },
+    { id: "b", prompt: "允许 B" },
+  ];
+  app.renderAgentTranscript();
+  const html = app.element("#agent-transcript").innerHTML;
+  assert.match(html, /允许 A/);
+  assert.match(html, /允许 B/);
+  assert.equal((html.match(/class="approval-card"/g) || []).length, 2);
+});
+
+test("并发恢复只订阅一次同一请求", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  app.state.agentSessionId = "one";
+  app.state.activeRequest = "reconnecting";
+  let resolvePage;
+  let pageCalls = 0;
+  let subscriptions = 0;
+  app.state.rpc = { request(method) {
+    if (method === "session.load_page") {
+      pageCalls += 1;
+      return { promise: pageCalls === 1
+        ? new Promise((resolve) => { resolvePage = resolve; })
+        : Promise.resolve({ messages: [], active_requests: [], session_id: "one" }) };
+    }
+    if (method === "agent.subscribe") { subscriptions += 1; return { id: 5, promise: Promise.resolve({ content: "完成" }) }; }
+    if (method === "session.list") return { promise: Promise.resolve({ sessions: [] }) };
+    throw new Error(method);
+  } };
+  const first = app.recoverAgentTurn();
+  await app.recoverAgentTurn();
+  resolvePage({ messages: [], active_requests: [7] });
+  await first;
+  assert.equal(subscriptions, 1);
+});
+
+test("快速新建任务只创建一个 Session", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  let resolveNew;
+  let creations = 0;
+  app.state.rpc = { request(method) {
+    if (method === "session.new") {
+      creations += 1;
+      return { promise: new Promise((resolve) => { resolveNew = resolve; }) };
+    }
+    if (method === "session.list") return { promise: Promise.resolve({ sessions: [] }) };
+    throw new Error(method);
+  } };
+  const first = app.newAgentSession();
+  await app.newAgentSession();
+  assert.equal(creations, 1);
+  resolveNew({ session_id: "new", messages: [] });
+  await first;
 });

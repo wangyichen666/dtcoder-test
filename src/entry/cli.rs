@@ -75,8 +75,10 @@ pub async fn run_repl(client: &DaemonClient, session_id: &mut String) -> Result<
             continue;
         }
         if input.starts_with('/') {
-            if run_slash(client, input, session_id).await? {
-                break;
+            match run_slash(client, input, session_id).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => eprintln!("命令失败：{error:#}"),
             }
         } else {
             if let Err(error) = run_chat(client, input, session_id).await {
@@ -267,13 +269,19 @@ async fn cancel_request(
     request_id: &RequestId,
     session_id: &str,
 ) -> Result<()> {
-    request_result(
+    let result = request_result(
         client,
         "agent.cancel",
         json!({"request_id": request_id, "session_id": session_id}),
     )
-    .await
-    .map(|_| ())
+    .await?;
+    if result["cancelled"].as_bool() == Some(false) {
+        anyhow::bail!(
+            "停止请求未生效：{}",
+            result["reason"].as_str().unwrap_or("请求已结束或无法取消")
+        );
+    }
+    Ok(())
 }
 
 async fn respond_to_approval(client: &DaemonClient, data: &Value) -> Result<()> {
