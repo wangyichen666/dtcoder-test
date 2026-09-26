@@ -360,6 +360,8 @@ cargo fmt --all -- --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
+node --test web/app.test.cjs
+node --check web/app.js
 ```
 
 测试使用本地 mock Provider，不需要真实 API Key。真实模型端到端测试需要自行提供对应服务配置。

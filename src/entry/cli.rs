@@ -79,7 +79,9 @@ pub async fn run_repl(client: &DaemonClient, session_id: &mut String) -> Result<
                 break;
             }
         } else {
-            run_chat(client, input, session_id).await?;
+            if let Err(error) = run_chat(client, input, session_id).await {
+                eprintln!("任务失败：{error:#}");
+            }
         }
     }
     Ok(())

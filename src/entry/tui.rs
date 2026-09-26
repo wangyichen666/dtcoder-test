@@ -1036,10 +1036,18 @@ async fn begin_turn(client: &DaemonClient, state: &mut TuiState, message: String
         "queue.list",
         json!({"session_id": state.session_id}),
     )
-    .await?;
-    let count = queued["items"].as_array().map_or(0, Vec::len);
-    state.queued_count = count;
-    state.status = format!("等待模型响应 · request={request_label} · 队列 {count}");
+    .await;
+    match queued {
+        Ok(queued) => {
+            let count = queued["items"].as_array().map_or(0, Vec::len);
+            state.queued_count = count;
+            state.status = format!("等待模型响应 · request={request_label} · 队列 {count}");
+        }
+        Err(error) => {
+            state.status = format!("等待模型响应 · request={request_label} · 队列状态暂不可用");
+            tracing::warn!(%error, "任务已提交，但查询队列失败");
+        }
+    }
     Ok(())
 }
 

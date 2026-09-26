@@ -3,6 +3,9 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
+  const graphemeSegmenter = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("zh-CN", { granularity: "grapheme" })
+    : null;
   const state = {
     rpc: null,
     connected: false,
@@ -24,6 +27,14 @@
     inspectedTraceHasMore: false,
     traceFilter: "all",
     activeRequest: null,
+    activeRunId: null,
+    activeRunSeq: 0,
+    submitting: false,
+    cancelling: false,
+    reconnectTimer: null,
+    reconnectAttempts: 0,
+    connectionAttempt: 0,
+    browseRequest: 0,
     draftAssistant: null,
     pendingApproval: null,
     agentFollowBottom: true,
@@ -32,6 +43,7 @@
     collapsedDays: new Set(),
     permissionMode: null,
     modelProfiles: [],
+    modelRequest: 0,
     activeModelId: null,
     modelConfigPath: "",
     transcriptRenderPending: false,
@@ -52,8 +64,20 @@
         const protocol = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(`${protocol}//${location.host}/ws`);
         this.socket = socket;
-        const timeout = setTimeout(() => reject(new Error("连接 daemon 超时")), 8000);
+        let settled = false;
+        const settle = (error, workspace) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve(workspace);
+        };
+        const timeout = setTimeout(() => {
+          settle(new Error("连接 daemon 超时"));
+          socket.close();
+        }, 8000);
         socket.addEventListener("open", () => {
+          if (settled) return;
           socket.send(JSON.stringify({
             type: "connect",
             token: this.token || undefined,
@@ -64,13 +88,13 @@
           let frame;
           try { frame = JSON.parse(event.data); } catch { return; }
           if (frame.type === "connected") {
-            clearTimeout(timeout);
-            resolve(frame.workspace || this.workspace);
+            settle(null, frame.workspace || this.workspace);
             return;
           }
           if (frame.type === "error") {
-            clearTimeout(timeout);
-            reject(new Error(frame.error || "连接失败"));
+            if (settled) return;
+            settle(new Error(frame.error || "连接失败"));
+            socket.close();
             return;
           }
           if (frame.type === "recovery" || frame.type === "recovery_error") return;
@@ -86,16 +110,17 @@
           }
         });
         socket.addEventListener("close", () => {
-          clearTimeout(timeout);
+          settle(new Error("WebSocket 已断开"));
           for (const pending of this.pending.values()) pending.reject(new Error("WebSocket 已断开"));
           this.pending.clear();
           if (state.rpc === this) {
             state.connected = false;
-            setConnection("error", "连接已断开");
+            setConnection("connecting", "连接已断开，正在重连");
             setAgentControls();
+            scheduleReconnect();
           }
         });
-        socket.addEventListener("error", () => reject(new Error("无法连接 Web 服务")));
+        socket.addEventListener("error", () => settle(new Error("无法连接 Web 服务")));
       });
     }
 
@@ -107,7 +132,12 @@
       const promise = new Promise((resolve, reject) => {
         this.pending.set(String(id), { resolve, reject, onEvent });
       });
-      this.socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      try {
+        this.socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      } catch (error) {
+        this.pending.delete(String(id));
+        return { id: null, promise: Promise.reject(error) };
+      }
       return { id, promise };
     }
 
@@ -116,7 +146,7 @@
 
   async function bootstrap() {
     const requested = new URL(location.href).searchParams.get("workspace")
-      || localStorage.getItem("my-agent-workspace")
+      || safeStorageGet("my-agent-workspace")
       || "";
     try {
       const health = await fetchJson("/health");
@@ -127,33 +157,70 @@
     await connect(requested || state.defaultWorkspace);
   }
 
-  async function connect(workspace = state.workspace) {
-    state.rpc?.close();
+  async function connect(workspace = state.workspace, automatic = false) {
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    const attempt = ++state.connectionAttempt;
+    const previous = state.rpc;
+    const previousConnected = previous?.socket?.readyState === WebSocket.OPEN;
     state.connected = false;
     setConnection("connecting", "正在连接工作区");
     setAgentControls();
     const rpc = new RpcSocket(apiToken(), workspace);
-    state.rpc = rpc;
     try {
       const connectedWorkspace = await rpc.connect();
-      if (state.rpc !== rpc) return;
-      state.workspace = connectedWorkspace || workspace;
+      if (attempt !== state.connectionAttempt) { rpc.close(); return false; }
+      if (rpc.socket && rpc.socket.readyState !== WebSocket.OPEN) throw new Error("连接已断开");
+      const nextWorkspace = connectedWorkspace || workspace;
+      const changedWorkspace = Boolean(state.workspace && state.workspace !== nextWorkspace);
+      state.rpc = rpc;
+      previous?.close();
+      if (changedWorkspace) resetWorkspaceState();
+      state.workspace = nextWorkspace;
       state.connected = true;
+      state.reconnectAttempts = 0;
+      if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
       rememberWorkspace(state.workspace);
       updateWorkspaceUrl(state.workspace);
       updateWorkspaceUi();
+      updateAgentSessionUi();
       setConnection("online", "Agent 已连接");
       setAgentControls();
-      await loadPermissionMode();
-      await loadModels();
-      await refreshSessions();
+      if (state.activeRequest === "reconnecting") {
+        recoverAgentTurn().catch((error) => toast(`恢复任务失败：${error.message}`));
+      }
+      const [, , sessions] = await Promise.allSettled([loadPermissionMode(), loadModels(), refreshSessions()]);
+      if (sessions.status === "rejected" && attempt === state.connectionAttempt && state.rpc === rpc) {
+        toast(`读取 Session 列表失败：${sessions.reason.message}`);
+      }
+      return attempt === state.connectionAttempt && state.rpc === rpc && state.connected;
     } catch (error) {
-      if (state.rpc !== rpc) return;
-      state.connected = false;
-      setConnection("error", "工作区连接失败");
+      rpc.close();
+      if (attempt !== state.connectionAttempt) return false;
+      state.rpc = previous;
+      const restored = previousConnected && previous?.socket?.readyState === WebSocket.OPEN;
+      state.connected = restored;
+      setConnection(restored ? "online" : "error", restored ? "Agent 已连接" : "工作区连接失败");
       setAgentControls();
-      toast(`${error.message}。请检查目录或连接设置。`);
+      if (!automatic) toast(`${error.message}。请检查目录或连接设置。`);
+      if (automatic && !restored) scheduleReconnect();
+      return false;
     }
+  }
+
+  function scheduleReconnect() {
+    if (state.reconnectTimer || state.connected || state.reconnectAttempts >= 5) {
+      if (state.reconnectAttempts >= 5) setConnection("error", "自动重连失败，请手动重试");
+      return;
+    }
+    const delay = Math.min(1000 * 2 ** state.reconnectAttempts, 16000);
+    state.reconnectAttempts += 1;
+    setConnection("connecting", `正在重连（第 ${state.reconnectAttempts}/5 次）`);
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      connect(state.workspace, true);
+    }, delay);
   }
 
   function setConnection(mode, label) {
@@ -164,16 +231,18 @@
   }
 
   function setAgentControls() {
-    const ready = state.connected && !state.activeRequest;
-    $("#new-agent-session").disabled = !state.connected || Boolean(state.activeRequest);
+    const ready = state.connected && !state.activeRequest && !state.submitting;
+    $("#new-agent-session").disabled = !state.connected || Boolean(state.activeRequest) || state.submitting;
     $("#prompt").disabled = !ready;
     $("#send").disabled = !ready;
     $("#inspect-current").disabled = !state.agentSessionId;
-    $("#workspace-trigger").disabled = Boolean(state.activeRequest);
-    $("#change-workspace").disabled = Boolean(state.activeRequest);
-    $("#permission-trigger").disabled = !state.connected || Boolean(state.activeRequest);
+    $("#workspace-trigger").disabled = Boolean(state.activeRequest) || state.submitting;
+    $("#change-workspace").disabled = Boolean(state.activeRequest) || state.submitting;
+    $("#permission-trigger").disabled = !state.connected || Boolean(state.activeRequest) || state.submitting;
     $("#send").setAttribute("aria-busy", String(Boolean(state.activeRequest)));
     $("#agent-transcript").setAttribute("aria-busy", String(Boolean(state.activeRequest)));
+    $("#cancel-turn").disabled = state.cancelling || !state.connected
+      || (state.activeRequest === "reconnecting" && !state.activeRunId);
     updateLatestButton();
   }
 
@@ -187,11 +256,14 @@
 
   async function loadPermissionMode() {
     if (!state.connected) return;
+    const rpc = state.rpc;
     try {
-      const result = await state.rpc.request("permissions.get").promise;
+      const result = await rpc.request("permissions.get").promise;
+      if (rpc !== state.rpc) return;
       state.permissionMode = result.mode;
       updatePermissionUi(result);
     } catch (error) {
+      if (rpc !== state.rpc) return;
       state.permissionMode = null;
       $("#permission-label").textContent = "不可用";
       toast(`读取权限模式失败：${error.message}`);
@@ -199,14 +271,17 @@
   }
 
   async function loadModels() {
+    const request = ++state.modelRequest;
     try {
       const result = await fetchJson("/api/models");
+      if (request !== state.modelRequest) return;
       state.modelProfiles = result.profiles || [];
       state.activeModelId = result.active_id || null;
       state.modelConfigPath = result.config_path || "";
       renderModelProfiles();
       updateModelUi();
     } catch (error) {
+      if (request !== state.modelRequest) return;
       state.modelProfiles = [];
       state.activeModelId = null;
       updateModelUi();
@@ -244,7 +319,7 @@
   }
 
   async function useModelProfile(id) {
-    if (!id || state.activeRequest) return;
+    if (!id) return;
     try {
       const result = await fetchJson("/api/models/activate", {
         method: "POST",
@@ -253,7 +328,8 @@
       });
       state.activeModelId = result.active_id || id;
       await loadModels();
-      toast(result.warning ? `已保存切换；${result.warning}` : `已切换模型：${result.profile?.name || id}`);
+      const timing = state.activeRequest ? "；当前任务沿用原模型，后续任务使用新模型" : "";
+      toast(result.warning ? `已保存切换；${result.warning}${timing}` : `已切换模型：${result.profile?.name || id}${timing}`);
     } catch (error) {
       toast(`切换模型失败：${error.message}`);
     }
@@ -272,10 +348,6 @@
   }
 
   async function saveModelProfile() {
-    if (state.activeRequest) {
-      toast("当前 Agent 正在工作，完成或停止本轮后再修改模型配置。");
-      return;
-    }
     const apiType = $("#model-api-type").value;
     const model = $("#model-name").value.trim();
     const baseUrl = $("#model-base-url").value.trim();
@@ -313,9 +385,10 @@
       });
       state.activeModelId = result.active_id || state.activeModelId;
       await loadModels();
+      const timing = state.activeRequest && $("#model-activate").checked ? "；当前任务沿用原模型，后续任务使用新模型" : "";
       toast(result.warning
-        ? `模型配置已保存；${result.warning}`
-        : `模型配置已保存：${result.profile?.name || model}`);
+        ? `模型配置已保存；${result.warning}${timing}`
+        : `模型配置已保存：${result.profile?.name || model}${timing}`);
       if (!state.connected) await connect(state.workspace || state.defaultWorkspace);
     } catch (error) {
       toast(`保存模型配置失败：${error.message}`);
@@ -359,15 +432,21 @@
 
   async function refreshSessions() {
     if (!state.connected) return;
-    const result = await state.rpc.request("session.list").promise;
+    const rpc = state.rpc;
+    const result = await rpc.request("session.list").promise;
+    if (rpc !== state.rpc) return;
     state.sessions = result.sessions || [];
     renderSessions();
 
-    if (!state.sessions.some((item) => item.id === state.agentSessionId)) {
+    if (!state.activeRequest && !state.submitting && !state.sessions.some((item) => item.id === state.agentSessionId)) {
       state.agentSessionId = state.sessions[0]?.id || null;
     }
-    if (state.agentSessionId) await loadAgentSession(state.agentSessionId);
-    else resetAgentSession();
+    if (state.agentSessionId) {
+      if (!state.activeRequest && !state.submitting) await loadAgentSession(state.agentSessionId);
+    } else {
+      resetAgentSession();
+    }
+    if (rpc !== state.rpc) return;
 
     if (!state.sessions.some((item) => item.id === state.inspectedSessionId)) {
       state.inspectedSessionId = state.sessions[0]?.id || null;
@@ -449,19 +528,23 @@
   }
 
   async function loadAgentSession(sessionId) {
+    const rpc = state.rpc;
     try {
-      const snapshot = await state.rpc.request("session.load_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
-      if (state.agentSessionId !== sessionId) return;
+      const snapshot = await rpc.request("session.load_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
+      if (rpc !== state.rpc || state.agentSessionId !== sessionId) return;
       state.agentSnapshot = snapshot;
       renderAgentTranscript();
       updateAgentSessionUi();
     } catch (error) {
+      if (rpc !== state.rpc || state.agentSessionId !== sessionId) return;
       toast(`读取 Agent Session 失败：${error.message}`);
     }
   }
 
   async function inspectSession(sessionId, rerender = true) {
     state.inspectedSessionId = sessionId;
+    $("#load-more-messages").disabled = false;
+    $("#load-more-traces").disabled = false;
     if (rerender) renderSessions();
     $("#session-title").textContent = shortId(sessionId, 34);
     $("#session-meta").textContent = "正在读取 Session 快照与执行链路…";
@@ -477,11 +560,11 @@
       const snapshotCall = state.rpc.request("session.load_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
       const traceCall = state.rpc.request("session.trace_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
       const [snapshotResult, traceResult] = await Promise.allSettled([snapshotCall, traceCall]);
+      if (state.inspectedSessionId !== sessionId) return;
       if (snapshotResult.status === "rejected") throw snapshotResult.reason;
       const snapshot = snapshotResult.value;
       const trace = traceResult.status === "fulfilled" ? traceResult.value : { records: [], total_records: 0 };
       if (traceResult.status === "rejected") toast(`链路读取失败：${traceResult.reason?.message || "未知错误"}`);
-      if (state.inspectedSessionId !== sessionId) return;
       state.inspectedSnapshot = snapshot;
       state.traces = trace.records || [];
       state.inspectedMessageOffset = (snapshot.offset || 0) + state.inspectedSnapshot.messages.length;
@@ -497,6 +580,7 @@
       $("#continue-session").disabled = false;
       updateSessionPagers();
     } catch (error) {
+      if (state.inspectedSessionId !== sessionId) return;
       $("#message-pager").classList.add("hidden");
       $("#trace-pager").classList.add("hidden");
       toast(`读取 Session 失败：${error.message}`);
@@ -525,9 +609,9 @@
       updateSessionPagers();
       updateSessionMeta();
     } catch (error) {
-      toast(`加载更多消息失败：${error.message}`);
+      if (state.inspectedSessionId === sessionId) toast(`加载更多消息失败：${error.message}`);
     } finally {
-      button.disabled = false;
+      if (state.inspectedSessionId === sessionId) button.disabled = false;
     }
   }
 
@@ -551,9 +635,9 @@
       updateSessionPagers();
       updateSessionMeta();
     } catch (error) {
-      toast(`加载更多链路失败：${error.message}`);
+      if (state.inspectedSessionId === sessionId) toast(`加载更多链路失败：${error.message}`);
     } finally {
-      button.disabled = false;
+      if (state.inspectedSessionId === sessionId) button.disabled = false;
     }
   }
 
@@ -596,7 +680,9 @@
   }
 
   function renderTranscript(node, messages, agentMode) {
-    const followLatest = !agentMode || state.agentFollowBottom || isNearBottom(node);
+    const followLatest = agentMode && (state.agentFollowBottom || isNearBottom(node));
+    const previousTop = node.scrollTop;
+    const openDetails = [...node.querySelectorAll("details")].map((item, index) => item.open ? index : -1).filter((index) => index >= 0);
     const html = messages.map((message) => renderMessage(message, agentMode)).join("");
     const approval = agentMode && state.pendingApproval ? renderApprovalCard(state.pendingApproval) : "";
     const empty = agentMode ? agentEmptyTemplate() : `
@@ -606,10 +692,13 @@
         <p>这个 Session 暂时没有消息。</p>
       </div>`;
     node.innerHTML = `${html || empty}${approval}`;
+    const nextDetails = node.querySelectorAll("details");
+    openDetails.forEach((index) => { if (nextDetails[index]) nextDetails[index].open = true; });
     if (agentMode) bindStarterButtons();
     if (agentMode) bindApprovalCard();
     requestAnimationFrame(() => {
       if (followLatest) node.scrollTop = node.scrollHeight;
+      else node.scrollTop = previousTop;
       if (agentMode) updateLatestButton(node);
     });
   }
@@ -621,7 +710,7 @@
   function updateLatestButton(node = $("#agent-transcript")) {
     if (!node) return;
     state.agentFollowBottom = isNearBottom(node);
-    $("#jump-latest").classList.toggle("hidden", state.agentFollowBottom || !state.activeRequest);
+    $("#jump-latest").classList.toggle("hidden", state.agentFollowBottom);
   }
 
   function scrollAgentToLatest() {
@@ -894,7 +983,9 @@
   }
 
   async function refreshSessionListOnly() {
-    const result = await state.rpc.request("session.list").promise;
+    const rpc = state.rpc;
+    const result = await rpc.request("session.list").promise;
+    if (rpc !== state.rpc) return;
     state.sessions = result.sessions || [];
     renderSessions();
   }
@@ -924,15 +1015,19 @@
   async function sendPrompt(event) {
     event.preventDefault();
     const prompt = $("#prompt").value.trim();
-    if (!prompt || !state.connected || state.activeRequest) return;
-    let completed = false;
+    if (!prompt || !state.connected || state.activeRequest || state.submitting) return;
+    state.submitting = true;
+    setAgentControls();
+    let sent = false;
+    let disconnected = false;
+    let optimisticUser = null;
     try {
       const sessionId = await ensureAgentSession();
-      $("#prompt").value = "";
-      resizePrompt();
+      if (!state.connected) throw new Error("连接已断开，任务尚未提交");
       state.agentSnapshot ||= { messages: [] };
       state.agentSnapshot.messages ||= [];
-      state.agentSnapshot.messages.push({ role: "user", content: prompt });
+      optimisticUser = { role: "user", content: prompt };
+      state.agentSnapshot.messages.push(optimisticUser);
       state.draftAssistant = { role: "assistant", content: "" };
       state.pendingApproval = null;
       state.agentFollowBottom = true;
@@ -948,37 +1043,150 @@
         { message: prompt, session_id: sessionId },
         handleAgentEvent,
       );
+      if (call.id == null) {
+        await call.promise;
+        throw new Error("任务尚未提交，连接已断开");
+      }
+      sent = true;
+      $("#prompt").value = "";
+      resizePrompt();
       state.activeRequest = call.id;
+      state.activeRunId = null;
+      state.activeRunSeq = 0;
       setAgentControls();
       await call.promise;
-      completed = true;
-      addActivity("turn", "任务完成", "结果已写入当前 Session");
-      setAgentStatus("idle", "已完成");
-      toast("Agent 任务完成");
+      await finishAgentTurn();
     } catch (error) {
-      state.agentSnapshot ||= { messages: [] };
-      state.agentSnapshot.messages ||= [];
-      if (state.draftAssistant && !state.draftAssistant.content && !state.draftAssistant.thinking) {
-        const draftIndex = state.agentSnapshot.messages.indexOf(state.draftAssistant);
-        if (draftIndex >= 0) state.agentSnapshot.messages.splice(draftIndex, 1);
+      disconnected = sent && (!state.connected || error.message === "WebSocket 已断开");
+      if (disconnected) {
+        state.activeRequest = "reconnecting";
+        addActivity("turn", "连接中断", "正在重连并确认任务状态；Agent 可能仍在运行");
+        setAgentStatus("waiting", "确认任务状态");
+        if (state.connected) recoverAgentTurn().catch((failure) => toast(`恢复任务失败：${failure.message}`));
+      } else {
+        if (!sent && optimisticUser) {
+          state.agentSnapshot.messages = state.agentSnapshot.messages.filter((message) => message !== optimisticUser);
+        }
+        failAgentTurn(error, sent);
+        if (!sent && !$("#prompt").value.trim()) {
+          $("#prompt").value = prompt;
+          resizePrompt();
+        }
       }
-      state.agentSnapshot.messages.push({ role: "system", content: `任务失败：${error.message}` });
-      addActivity("error", "任务失败", error.message);
-      setAgentStatus("error", "失败");
-      renderAgentTranscript();
-      toast(`任务失败：${error.message}`);
     } finally {
-      state.activeRequest = null;
-      state.draftAssistant = null;
-      state.pendingApproval = null;
-      $("#cancel-turn").classList.add("hidden");
+      state.submitting = false;
+      if (!disconnected) clearAgentTurn();
       setAgentControls();
       await refreshSessionListOnly().catch(() => {});
-      if (completed && state.agentSessionId) await loadAgentSession(state.agentSessionId);
+    }
+  }
+
+  async function finishAgentTurn() {
+    addActivity("turn", "任务完成", "结果已写入当前 Session");
+    setAgentStatus("idle", "已完成");
+    toast("Agent 任务完成");
+    if (state.agentSessionId) await loadAgentSession(state.agentSessionId);
+  }
+
+  function failAgentTurn(error, submitted = true) {
+    const label = submitted ? "任务失败" : "提交失败";
+    state.agentSnapshot ||= { messages: [] };
+    state.agentSnapshot.messages ||= [];
+    if (state.draftAssistant && !state.draftAssistant.content && !state.draftAssistant.thinking) {
+      const index = state.agentSnapshot.messages.indexOf(state.draftAssistant);
+      if (index >= 0) state.agentSnapshot.messages.splice(index, 1);
+    }
+    state.agentSnapshot.messages.push({ role: "system", content: `${label}：${error.message}` });
+    addActivity("error", label, error.message);
+    setAgentStatus("error", "失败");
+    renderAgentTranscript();
+    toast(`${label}：${error.message}`);
+  }
+
+  function clearAgentTurn() {
+    state.activeRequest = null;
+    state.activeRunId = null;
+    state.activeRunSeq = 0;
+    state.draftAssistant = null;
+    state.pendingApproval = null;
+    state.cancelling = false;
+    $("#cancel-turn").disabled = false;
+    $("#cancel-turn").classList.add("hidden");
+  }
+
+  async function recoverAgentTurn() {
+    if (state.activeRequest !== "reconnecting" || !state.agentSessionId) return;
+    const rpc = state.rpc;
+    const sessionId = state.agentSessionId;
+    const snapshot = await rpc.request("session.load_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
+    if (rpc !== state.rpc || state.activeRequest !== "reconnecting") return;
+    const active = snapshot.active_requests || [];
+    if (!active.length) {
+      state.agentSnapshot = snapshot;
+      renderAgentTranscript();
+      setAgentStatus("idle", "任务已结束");
+      addActivity("turn", "已确认任务状态", "任务不再运行；请查看 Session 中的最终结果");
+      clearAgentTurn();
+      setAgentControls();
+      return;
+    }
+    let requestId = active.length === 1 ? active[0] : null;
+    if (state.activeRunId) {
+      try {
+        const run = await rpc.request("run.read", { run_id: state.activeRunId }).promise;
+        if (active.some((id) => JSON.stringify(id) === JSON.stringify(run.request_id))) requestId = run.request_id;
+      } catch (error) {
+        if (active.length !== 1) throw error;
+      }
+    }
+    if (rpc !== state.rpc || state.activeRequest !== "reconnecting") return;
+    if (requestId == null) {
+      setAgentStatus("waiting", "多个任务运行中");
+      toast("当前 Session 有多个活动任务，请在 Session 查看中确认目标任务。");
+      return;
+    }
+    state.pendingApproval = snapshot.pending_approvals?.[0] || null;
+    renderAgentTranscript();
+    const call = rpc.request("agent.subscribe", {
+      request_id: requestId,
+      session_id: sessionId,
+      after_seq: state.activeRunSeq,
+    }, handleAgentEvent);
+    state.activeRequest = call.id;
+    setAgentStatus("running", "已恢复任务流");
+    setAgentControls();
+    try {
+      const result = await call.promise;
+      if (result?.subscribed === false) {
+        const latest = await rpc.request("session.load_page", { session_id: sessionId, offset: 0, limit: 60 }).promise;
+        state.agentSnapshot = latest;
+        renderAgentTranscript();
+        setAgentStatus("waiting", "任务状态待确认");
+        addActivity("turn", "订阅已结束", "已重新读取 Session；请查看最终消息和执行链路");
+        return;
+      }
+      await finishAgentTurn();
+    } catch (error) {
+      if (rpc !== state.rpc) return;
+      if (call.id == null || !state.connected || error.message === "WebSocket 已断开") {
+        state.activeRequest = "reconnecting";
+        setAgentStatus("waiting", "重新连接中");
+        if (!state.reconnectTimer) scheduleReconnect();
+        return;
+      }
+      failAgentTurn(error);
+    } finally {
+      if (rpc === state.rpc) {
+        if (state.activeRequest !== "reconnecting") clearAgentTurn();
+        setAgentControls();
+        await refreshSessionListOnly().catch(() => {});
+      }
     }
   }
 
   function handleAgentEvent(frame) {
+    if (frame.run_id) state.activeRunId = frame.run_id;
+    if (Number.isInteger(frame.seq)) state.activeRunSeq = Math.max(state.activeRunSeq, frame.seq);
     const event = frame.event;
     const data = frame.data || {};
     if (event === "text_delta") {
@@ -1060,15 +1268,20 @@
   }
 
   async function cancelTurn() {
-    if (!state.activeRequest) return;
+    if (!state.activeRequest || state.cancelling || !state.connected) return;
+    state.cancelling = true;
+    $("#cancel-turn").disabled = true;
     try {
-      await state.rpc.request("agent.cancel", {
-        request_id: state.activeRequest,
-        session_id: state.agentSessionId,
-      }).promise;
+      const target = state.activeRunId
+        ? { run_id: state.activeRunId, session_id: state.agentSessionId }
+        : { request_id: state.activeRequest, session_id: state.agentSessionId };
+      const result = await state.rpc.request("agent.cancel", target).promise;
+      if (result?.cancelled === false) throw new Error(result.reason || "请求未在运行");
       addActivity("error", "已请求停止", "等待 Agent 结束当前步骤");
       toast("已发送停止请求");
     } catch (error) {
+      state.cancelling = false;
+      $("#cancel-turn").disabled = false;
       toast(`停止失败：${error.message}`);
     }
   }
@@ -1167,9 +1380,17 @@
   }
 
   async function browseDirectory(path) {
+    const request = ++state.browseRequest;
     $("#directory-list").innerHTML = `<div class="directory-empty">正在读取目录…</div>`;
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
-    const listing = await fetchJson(`/api/directories${query}`);
+    let listing;
+    try {
+      listing = await fetchJson(`/api/directories${query}`);
+    } catch (error) {
+      if (request !== state.browseRequest) return;
+      throw error;
+    }
+    if (request !== state.browseRequest) return;
     state.browsePath = listing.path;
     state.browseParent = listing.parent || null;
     $("#browse-path").value = listing.path;
@@ -1190,14 +1411,24 @@
   }
 
   async function selectBrowsedWorkspace() {
+    if (state.activeRequest || state.submitting) {
+      toast("当前任务结束后再切换工作目录。");
+      return;
+    }
     if (!state.browsePath || state.browsePath === state.workspace) {
       $("#workspace-dialog").close();
       return;
     }
-    $("#workspace-dialog").close();
-    resetWorkspaceState();
-    await connect(state.browsePath);
-    switchView("agent");
+    $("#select-workspace").disabled = true;
+    state.browseRequest += 1;
+    try {
+      if (await connect(state.browsePath)) {
+        $("#workspace-dialog").close();
+        switchView("agent");
+      }
+    } finally {
+      $("#select-workspace").disabled = false;
+    }
   }
 
   function resetWorkspaceState() {
@@ -1238,16 +1469,22 @@
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
-  function apiToken() { return localStorage.getItem("my-agent-token") || ""; }
+  function safeStorageGet(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+  }
+  function apiToken() { return safeStorageGet("my-agent-token") || ""; }
   function recentWorkspaces() {
-    try { return JSON.parse(localStorage.getItem("my-agent-workspaces") || "[]"); }
+    try {
+      const paths = JSON.parse(safeStorageGet("my-agent-workspaces") || "[]");
+      return Array.isArray(paths) ? paths.filter((path) => typeof path === "string") : [];
+    }
     catch { return []; }
   }
   function rememberWorkspace(path) {
     if (!path) return;
-    localStorage.setItem("my-agent-workspace", path);
+    try { localStorage.setItem("my-agent-workspace", path); } catch { return; }
     const recents = [path, ...recentWorkspaces().filter((item) => item !== path)].slice(0, 8);
-    localStorage.setItem("my-agent-workspaces", JSON.stringify(recents));
+    try { localStorage.setItem("my-agent-workspaces", JSON.stringify(recents)); } catch { /* private browsing */ }
   }
   function updateWorkspaceUrl(path) {
     const url = new URL(location.href);
@@ -1268,7 +1505,10 @@
     const prompt = $("#prompt");
     prompt.style.height = "auto";
     prompt.style.height = `${Math.min(Math.max(prompt.scrollHeight, 88), 220)}px`;
-    $("#prompt-count").textContent = `${prompt.value.length} 字`;
+    const count = graphemeSegmenter
+      ? [...graphemeSegmenter.segment(prompt.value)].length
+      : Array.from(prompt.value).length;
+    $("#prompt-count").textContent = `${count} 字`;
   }
   function shortId(value = "", max = 22) {
     if (value.length <= max) return value;
