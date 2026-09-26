@@ -19,6 +19,8 @@ pub struct ConfigFile {
     pub active_profile: Option<String>,
     #[serde(default)]
     pub profiles: Vec<ProviderProfile>,
+    #[serde(default)]
+    pub fallback_profile_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -90,6 +92,15 @@ impl ConfigStore {
             && !config.profiles.iter().any(|profile| &profile.id == active)
         {
             bail!("活动模型配置不存在：{active}");
+        }
+        for fallback_id in &config.fallback_profile_ids {
+            if !config
+                .profiles
+                .iter()
+                .any(|profile| &profile.id == fallback_id)
+            {
+                bail!("备用模型配置不存在：{fallback_id}");
+            }
         }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {

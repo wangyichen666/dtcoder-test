@@ -59,6 +59,9 @@ impl ToolCallAssembler {
             };
         }
         match event {
+            ProviderEvent::ResponseStarted
+            | ProviderEvent::ProtocolDone
+            | ProviderEvent::Usage(_) => None,
             ProviderEvent::TextDelta(delta) => {
                 self.text.push_str(&delta);
                 Some(delta)

@@ -8,9 +8,9 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::{
-    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent, Role,
-    ToolArgumentsFragment, ToolCallStreamError, ToolSpec, outbound_wire_id, required_env,
-    send_event,
+    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent,
+    ProviderUsage, Role, ToolArgumentsFragment, ToolCallStreamError, ToolSpec, outbound_wire_id,
+    required_env, send_event,
 };
 
 pub struct AnthropicProvider {
@@ -96,16 +96,12 @@ impl Provider for AnthropicProvider {
             .json(&self.request_payload(messages, tools))
             .send()
             .await
-            .context("调用 Anthropic Messages 服务失败")?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .context("读取 Anthropic 错误响应失败")?;
-            anyhow::bail!("Anthropic 服务返回 {status}: {body}");
-        }
-        parse_sse(response, &events).await
+            .map_err(|error| super::ProviderError::from_reqwest(&error))?;
+        let response = super::checked_response(response).await?;
+        send_event(&events, ProviderEvent::ResponseStarted)?;
+        parse_sse(response, &events)
+            .await
+            .map_err(super::sanitize_provider_error)
     }
 }
 
@@ -203,6 +199,7 @@ fn parse_data_url(value: &str) -> Option<(&str, &str)> {
 #[derive(Default)]
 struct StreamState {
     tools: BTreeMap<u64, ExecutionIdentity>,
+    done: bool,
 }
 
 async fn parse_sse(
@@ -213,7 +210,7 @@ async fn parse_sse(
     let mut pending = Vec::new();
     let mut state = StreamState::default();
     while let Some(chunk) = stream.next().await {
-        pending.extend_from_slice(&chunk.context("读取 Anthropic SSE 失败")?);
+        pending.extend_from_slice(&chunk.map_err(super::stream_transport_error)?);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             while matches!(line.last(), Some(b'\n' | b'\r')) {
@@ -233,6 +230,13 @@ async fn parse_sse(
                 "Anthropic 流结束时仍有未完成的 tool_use content block",
             )),
         )?;
+    }
+    if !state.done {
+        return Err(super::ProviderError::new(
+            super::ProviderErrorKind::Protocol,
+            "Anthropic 流缺少 message_stop",
+        )
+        .into());
     }
     Ok(())
 }
@@ -256,26 +260,28 @@ fn consume_sse_line(
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "message_start" => log_usage("message_start", value.pointer("/message/usage")),
+        "message_start" => emit_usage("message_start", value.pointer("/message/usage"), events)?,
         "content_block_start" => start_content_block(&value, state, events)?,
         "content_block_delta" => consume_content_delta(&value, state, events)?,
         "content_block_stop" => stop_content_block(&value, state, events)?,
         "message_delta" => {
-            log_usage("message_delta", value.get("usage"));
+            emit_usage("message_delta", value.get("usage"), events)?;
             if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
                 send_event(events, ProviderEvent::OutputTruncated)?;
             }
         }
         "error" => {
-            send_event(
-                events,
-                ProviderEvent::ToolCallFailed(ToolCallStreamError::new(
-                    "provider_error",
-                    value.to_string(),
-                )),
-            )?;
+            return Err(super::ProviderError::new(
+                super::ProviderErrorKind::Server,
+                "Anthropic 流报告错误",
+            )
+            .into());
         }
-        "message_stop" | "ping" => {}
+        "message_stop" => {
+            state.done = true;
+            send_event(events, ProviderEvent::ProtocolDone)?;
+        }
+        "ping" => {}
         _ => {}
     }
     Ok(())
@@ -403,9 +409,13 @@ fn emit_failure(
     )
 }
 
-fn log_usage(event: &str, usage: Option<&Value>) {
+fn emit_usage(
+    event: &str,
+    usage: Option<&Value>,
+    events: &mpsc::UnboundedSender<ProviderEvent>,
+) -> Result<()> {
     let Some(usage) = usage else {
-        return;
+        return Ok(());
     };
     debug!(
         provider = "anthropic-messages",
@@ -416,6 +426,15 @@ fn log_usage(event: &str, usage: Option<&Value>) {
         cache_read_input_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
         "LLM token 用量"
     );
+    send_event(
+        events,
+        ProviderEvent::Usage(ProviderUsage {
+            input_tokens: usage["input_tokens"].as_u64(),
+            output_tokens: usage["output_tokens"].as_u64(),
+            cache_read_tokens: usage["cache_read_input_tokens"].as_u64(),
+            cache_creation_tokens: usage["cache_creation_input_tokens"].as_u64(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -497,6 +516,13 @@ mod tests {
             &events,
         )
         .unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ProviderEvent::Usage(ProviderUsage {
+                output_tokens: Some(8192),
+                ..Default::default()
+            })
+        );
         assert_eq!(receiver.try_recv().unwrap(), ProviderEvent::OutputTruncated);
     }
 }

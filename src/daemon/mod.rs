@@ -20,7 +20,7 @@ use crate::config::ConfigStore;
 use crate::cron::CronManager;
 use crate::loop_engine::{CancellationToken, LoopEngine};
 use crate::mcp::McpManager;
-use crate::provider::{Message, ProviderManager};
+use crate::provider::{FrozenRoute, Message, ProviderManager};
 use crate::safety::SafetyPolicy;
 use crate::session::SessionStore;
 use crate::skills::SkillLibrary;
@@ -43,6 +43,7 @@ pub struct DaemonState {
     pub(crate) cron: Option<Arc<CronManager>>,
     pub(crate) mcp: Option<Arc<McpManager>>,
     pub(crate) provider_manager: Option<Arc<ProviderManager>>,
+    pub(crate) frozen_routes: Mutex<HashMap<RunId, FrozenRoute>>,
     pub(crate) config_store: ConfigStore,
     pub(crate) daemon_log_path: PathBuf,
 }
@@ -301,6 +302,7 @@ impl DaemonState {
             cron,
             mcp,
             provider_manager,
+            frozen_routes: Mutex::new(HashMap::new()),
             config_store,
             daemon_log_path,
         }

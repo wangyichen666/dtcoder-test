@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::{
-    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent, Role,
-    ToolArgumentsFragment, ToolSpec, optional_bool_env, required_env, send_event,
+    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent,
+    ProviderUsage, Role, ToolArgumentsFragment, ToolSpec, optional_bool_env, required_env,
+    send_event,
 };
 
 pub struct OllamaProvider {
@@ -93,13 +94,12 @@ impl Provider for OllamaProvider {
             .json(&self.request_payload(messages, tools))
             .send()
             .await
-            .context("调用 Ollama 服务失败")?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.context("读取 Ollama 错误响应失败")?;
-            anyhow::bail!("Ollama 服务返回 {status}: {body}");
-        }
-        parse_ndjson(response, &events).await
+            .map_err(|error| super::ProviderError::from_reqwest(&error))?;
+        let response = super::checked_response(response).await?;
+        send_event(&events, ProviderEvent::ResponseStarted)?;
+        parse_ndjson(response, &events)
+            .await
+            .map_err(super::sanitize_provider_error)
     }
 }
 
@@ -139,18 +139,26 @@ async fn parse_ndjson(
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut position = 0_u64;
+    let mut done = false;
     while let Some(chunk) = stream.next().await {
-        pending.extend_from_slice(&chunk.context("读取 Ollama NDJSON 失败")?);
+        pending.extend_from_slice(&chunk.map_err(super::stream_transport_error)?);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
-            consume_ndjson_line(&line, &mut position, events)?;
+            done |= consume_ndjson_line(&line, &mut position, events)?;
         }
     }
     if !pending.is_empty() {
-        consume_ndjson_line(&pending, &mut position, events)?;
+        done |= consume_ndjson_line(&pending, &mut position, events)?;
+    }
+    if !done {
+        return Err(super::ProviderError::new(
+            super::ProviderErrorKind::Protocol,
+            "Ollama 流缺少 done 事件",
+        )
+        .into());
     }
     Ok(())
 }
@@ -159,13 +167,18 @@ fn consume_ndjson_line(
     line: &[u8],
     position: &mut u64,
     events: &mpsc::UnboundedSender<ProviderEvent>,
-) -> Result<()> {
+) -> Result<bool> {
     if line.iter().all(u8::is_ascii_whitespace) {
-        return Ok(());
+        return Ok(false);
     }
     let chunk: OllamaChunk = serde_json::from_slice(line).context("解析 Ollama NDJSON 失败")?;
     if let Some(error) = chunk.error {
-        anyhow::bail!("Ollama 流返回错误: {error}");
+        let _ = error;
+        return Err(super::ProviderError::new(
+            super::ProviderErrorKind::Server,
+            "Ollama 流报告错误",
+        )
+        .into());
     }
     if let Some(message) = chunk.message {
         if let Some(thinking) = message.thinking.or(message.reasoning)
@@ -213,8 +226,18 @@ fn consume_ndjson_line(
             cache_read_input_tokens = 0,
             "LLM token 用量"
         );
+        send_event(
+            events,
+            ProviderEvent::Usage(ProviderUsage {
+                input_tokens: chunk.prompt_eval_count,
+                output_tokens: chunk.eval_count,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        )?;
+        send_event(events, ProviderEvent::ProtocolDone)?;
     }
-    Ok(())
+    Ok(chunk.done)
 }
 
 #[derive(Deserialize)]

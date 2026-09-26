@@ -130,6 +130,8 @@ cargo build --release
 
 首次使用也可以直接运行 `my-agent serve`，打开 Web 工作台右上角设置，在“模型配置”中保存一次；配置会写入用户级文件（默认 `~/.config/my-agent/config.json`，可用 `MY_AGENT_CONFIG` 或 `XDG_CONFIG_HOME` 调整），后续新终端自动复用。文件权限为用户私有，API key 不会出现在 Session 或接口返回中。
 
+可在配置文件中加入 `"fallback_profile_ids": ["备用配置ID"]`，按顺序指定备用模型。每个 run 准入时冻结主模型、备用顺序、超时和重试策略；运行中的 `/models` 切换只影响之后准入的 run。冻结快照只保存配置 ID、模型和服务地址摘要，不保存密钥。若 daemon 重启后排队 run 所需配置已被删除或改变，该 run 会明确失败，不会悄悄改用新配置。
+
 OpenAI 兼容服务示例：
 
 ```bash
@@ -191,7 +193,7 @@ my-agent
 /run <run_id>
 ```
 
-`/models` 不带参数时列出已保存配置；例如 `/models 2` 或 `/models deepseek` 会切换活动模型。Web 设置支持保存多个 OpenAI 兼容、Anthropic Messages 和 Ollama 配置；Agent 正在执行任务时切换会被拒绝，避免中途改变请求。
+`/models` 不带参数时列出已保存配置；例如 `/models 2` 或 `/models deepseek` 会切换活动模型。Web 设置支持保存多个 OpenAI 兼容、Anthropic Messages 和 Ollama 配置。运行中的 run 保持其准入时的路由快照。
 
 在 TUI 输入 `/dogfood` 会在 session 文件所在目录生成 `dogfood-<session>.log`，其中包含当前 session 的原始 LLM/ReAct 对话（用户消息、助手回复、工具调用参数和工具输出），以及按 `session_id` 筛选的 daemon 全链路日志。TUI 只显示生成文件的绝对路径，不把日志正文塞入对话区。
 
@@ -255,6 +257,7 @@ Cron：
 - **断线恢复**：daemon 在工作区 `.my-agent/runtime.sqlite3` 中保存 run、turn、队列、工具回执、事件序号、交互和终态。`agent.subscribe` 先回放持久事件，再接实时通知；缺口以 `resync_required` 返回 snapshot、`last_seq` 和分页游标。`run.read` / `run.events` 可在重启后查询。旧 JSONL 对话和 trace 保留。
 - **不确定结果**：daemon 重启时，已启动但未确认终态的 run 标为 `unknown_after_restart`，未启动的 queued run 保留并由 daemon 恢复调度。取消发生在副作用工具开始之后时也记为未知，避免已经执行工具却确认取消。未知副作用不自动重放。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
 - **工具回执与诊断**：工具批次在执行前写入 prepared，每个调用在执行前转为 running，结束后提交 typed outcome、最多 4096 字符的预览与本地完整输出 artifact 路径。`run.tools` 查看回执；`run.audit` 对照 SQLite、JSONL、trace 与 artifact 摘要并报告分歧。JSONL 匹配仅用于诊断，不能证明 run 成功。人工核实后可用 `run.reconcile` 记录显式修复。
+- **Provider 韧性**：HTTP、协议、传输和阶段超时以类型化错误记录。默认仅对限流、传输、服务端错误和部分超时做有限重试；同候选耗尽后，在本次尝试没有发布正文、thinking 或部分工具调用时才切换备用模型。连接、首语义事件、流静默和总尝试分别限时；SSE 注释、空行和 usage 不重置语义 idle 时钟。每次尝试在网络请求前入 SQLite，结束时记录错误类别、候选、TTFT、用量和终态；`run.provider_attempts` 可读回所有尝试及聚合用量。失败的 `terminal` 事件带 `provider_error_kind`；缺失的 token 字段保持 `null`。
 - **平滑升级**：ready 标记记录可执行文件内容指纹；重新构建后会优雅停止旧 daemon，再使用新版本启动。
 - **进程清理**：`exec` 默认 300 秒超时；取消或超时会清理整个子进程组。stdout/stderr 持续排空，每路只保留前 64 KiB；daemon 关闭时停止已登记的前台进程。
 
@@ -268,6 +271,7 @@ Cron：
 | `interaction.list` / `interaction.read` | `session_id` / `interaction_id` | 返回 owner、kind、status、revision 和类型化 payload |
 | `interaction.respond` / `interaction.reject` | `interaction_id`, `session_id`, `owner_run_id`, `revision`；respond 还需 `approved` | 先持久 claim 再唤醒；相同答案幂等，冲突答案拒绝。旧 `approval.respond` 仍可用 |
 | `run.read` / `run.events` / `run.tools` / `run.audit` | `run_id`；events 可带 `after_seq/limit` | 状态、分页事件、工具回执、一致性诊断 |
+| `run.provider_attempts` | `run_id` | 冻结 route、每次 Provider attempt、run 级 usage；不返回 API key 或原始上游响应 |
 | `run.reconcile` | `session_id`, `run_id`, `expected_last_seq`, `status`, `evidence`；completed 需 `content` | 只修复 unknown run；校验 owner 与事件序号，记录证据摘要和人工决议 |
 
 新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`run.reconcile` 仅供本地操作者在检查 `run.audit` 后使用，不会自动重放工具或修改旧 JSONL。`steer`、强沙箱、可恢复子 Agent 仍属于后续阶段。

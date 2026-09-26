@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -12,7 +12,11 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::context::ContextManager;
-use crate::provider::{Message, Provider, ProviderEvent, Response, Role, ToolCall};
+use crate::provider::{
+    AttemptStatus, FrozenRoute, Message, Provider, ProviderAttempt, ProviderError,
+    ProviderErrorKind, ProviderEvent, ProviderUsage, Response, RetryDecision, Role, TimeoutPhase,
+    TimeoutPolicy, ToolCall,
+};
 use crate::session::{SessionStore, SessionTraceRecord};
 use crate::storage::{RunId, RunStore, RuntimeError};
 use crate::tool_calls::ToolCallAssembler;
@@ -41,6 +45,7 @@ const REPETITION_THRESHOLD: usize = 3;
 const REPETITION_ABORT_THRESHOLD: usize = 10;
 const REPETITION_REMINDER: &str = "检测到连续重复的工具调用、参数与结果。可以继续使用任何工具，但请先判断该重复是否必要；若没有新信息，考虑换个思路或直接给出结论。";
 const PROGRESS_CHECKPOINT_REMINDER: &str = "这是一次长任务的进度检查点，不是终止信号。请核对当前计划和已完成工作：若任务已经完成，立即给出最终结论；若仍有必要工作，继续执行剩余步骤，避免重做已经完成的内容。";
+static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -123,6 +128,7 @@ pub struct LoopEngine {
     context: ContextManager,
     session: Option<Arc<SessionStore>>,
     round_limit: Option<usize>,
+    route: Option<FrozenRoute>,
 }
 
 impl LoopEngine {
@@ -144,6 +150,7 @@ impl LoopEngine {
             // 主任务不使用固定轮次硬上限。复杂任务依靠进度检查点继续运行，
             // 真正的失控则由重复调用与连续失败熔断器识别。
             round_limit: None,
+            route: None,
         }
     }
 
@@ -159,6 +166,7 @@ impl LoopEngine {
             context,
             session: None,
             round_limit: Some(max_rounds),
+            route: None,
         }
     }
 
@@ -169,7 +177,24 @@ impl LoopEngine {
             context: self.context.clone(),
             session: Some(session),
             round_limit: self.round_limit,
+            route: self.route.clone(),
         }
+    }
+
+    pub fn token_budget(&self) -> usize {
+        self.context.token_budget()
+    }
+
+    pub fn with_route(&self, route: FrozenRoute) -> Self {
+        let mut copy = self.clone();
+        let primary = route.primary();
+        copy.context = self
+            .context
+            .with_provider(primary.clone())
+            .with_token_budget(route.snapshot.context_policy.token_budget);
+        copy.provider = primary;
+        copy.route = Some(route);
+        copy
     }
 
     pub async fn run_turn(&self, history: &mut Vec<Message>, input: String) -> Result<String> {
@@ -486,8 +511,247 @@ impl LoopEngine {
         round: usize,
         trace_request_id: Option<&str>,
     ) -> Result<ModelOutput> {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled.into());
+        }
+        let Some(route) = &self.route else {
+            return self
+                .request_model_once(
+                    &self.provider,
+                    messages,
+                    specs,
+                    events,
+                    cancellation,
+                    round,
+                    trace_request_id,
+                    None,
+                    &mut AttemptObservation::default(),
+                )
+                .await;
+        };
+        let mut request_messages = messages.to_vec();
+        let mut compacted = false;
+        let mut last_error =
+            ProviderError::new(ProviderErrorKind::Server, "没有可用的 Provider 路由");
+        for (candidate_index, (candidate, provider)) in route
+            .snapshot
+            .candidates
+            .iter()
+            .zip(&route.providers)
+            .enumerate()
+        {
+            let circuit_key = candidate.circuit_key();
+            if route.circuit.acquire(&circuit_key) == crate::provider::CircuitState::Open {
+                if let Ok(audit) = TOOL_AUDIT.try_with(Clone::clone) {
+                    audit.store.append_event(
+                        &audit.run_id,
+                        "provider_circuit",
+                        &serde_json::json!({
+                            "candidate_index": candidate_index, "state": "open", "action": "skip",
+                        }),
+                    )?;
+                }
+                continue;
+            }
+            let mut prior_retries = 0;
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::Cancelled.into());
+                }
+                let audit = TOOL_AUDIT.try_with(Clone::clone).ok();
+                let mut attempt = audit.as_ref().map(|audit| ProviderAttempt {
+                    attempt_id: format!(
+                        "{}-{round}-{candidate_index}-{}",
+                        audit.run_id.0,
+                        NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)
+                    ),
+                    run_id: audit.run_id.clone(),
+                    round: round as u32,
+                    candidate_index: candidate_index as u32,
+                    provider_profile_id: candidate.profile_id.clone(),
+                    api_type: candidate.api_type,
+                    model: candidate.model.clone(),
+                    status: AttemptStatus::Started,
+                    error_kind: None,
+                    diagnostic: None,
+                    retry_after_ms: None,
+                    stream_committed: false,
+                    started_at_ms: unix_time_ms() as i64,
+                    first_event_at_ms: None,
+                    finished_at_ms: None,
+                    usage: None,
+                });
+                if let (Some(audit), Some(attempt)) = (&audit, &attempt) {
+                    audit.store.start_provider_attempt(attempt)?;
+                }
+                let mut observation = AttemptObservation::default();
+                let outcome = self
+                    .request_model_once(
+                        provider,
+                        &request_messages,
+                        specs,
+                        events,
+                        cancellation,
+                        round,
+                        trace_request_id,
+                        Some(&route.snapshot.timeout_policy),
+                        &mut observation,
+                    )
+                    .await;
+                let result: std::result::Result<(), ProviderError> = match outcome {
+                    Ok(_output) if observation.output_truncated => Err(ProviderError::new(
+                        ProviderErrorKind::OutputTruncated,
+                        "Provider 输出被截断",
+                    )),
+                    Ok(output) if matches!(&output.response, Response::Text(text) if text.is_empty()) =>
+                    {
+                        let kind = if output.thinking.is_some() {
+                            ProviderErrorKind::ReasoningOnly
+                        } else {
+                            ProviderErrorKind::EmptyCompletion
+                        };
+                        Err(ProviderError::new(kind, "Provider 未返回可用内容"))
+                    }
+                    Ok(output) => {
+                        if matches!(output.response, Response::ToolAssemblyFailed(_)) {
+                            last_error = ProviderError::new(
+                                ProviderErrorKind::Protocol,
+                                "工具调用流装配失败",
+                            );
+                        }
+                        if let (Some(audit), Some(attempt)) = (&audit, &mut attempt) {
+                            attempt.status =
+                                if matches!(output.response, Response::ToolAssemblyFailed(_)) {
+                                    AttemptStatus::Failed
+                                } else {
+                                    AttemptStatus::Succeeded
+                                };
+                            if attempt.status == AttemptStatus::Failed {
+                                attempt.error_kind = Some(last_error.kind);
+                                attempt.diagnostic = Some(last_error.diagnostic.clone());
+                            }
+                            finish_attempt(audit, attempt, &observation)?;
+                        }
+                        let circuit_state = route.circuit.record(
+                            &circuit_key,
+                            !matches!(output.response, Response::ToolAssemblyFailed(_)),
+                            false,
+                        );
+                        if let Some(audit) = &audit {
+                            audit.store.append_event(&audit.run_id, "provider_circuit", &serde_json::json!({
+                                "candidate_index": candidate_index, "state": format!("{circuit_state:?}").to_ascii_lowercase(),
+                            }))?;
+                        }
+                        return Ok(output);
+                    }
+                    Err(error) => Err(error.downcast::<ProviderError>().unwrap_or_else(|error| {
+                        if error
+                            .downcast_ref::<RuntimeError>()
+                            .is_some_and(|error| matches!(error, RuntimeError::Cancelled))
+                        {
+                            ProviderError::new(ProviderErrorKind::Cancelled, "请求已取消")
+                        } else {
+                            ProviderError::new(ProviderErrorKind::Protocol, "Provider 请求失败")
+                        }
+                    })),
+                };
+                let error = result.expect_err("失败分支");
+                if let (Some(audit), Some(attempt)) = (&audit, &mut attempt) {
+                    attempt.status = if error.kind == ProviderErrorKind::Cancelled {
+                        AttemptStatus::Cancelled
+                    } else {
+                        AttemptStatus::Failed
+                    };
+                    attempt.error_kind = Some(error.kind);
+                    attempt.diagnostic = Some(error.diagnostic.clone());
+                    attempt.retry_after_ms = error.diagnostic.retry_after_ms;
+                    finish_attempt(audit, attempt, &observation)?;
+                }
+                let transient = matches!(
+                    error.kind,
+                    ProviderErrorKind::RateLimit
+                        | ProviderErrorKind::Transport
+                        | ProviderErrorKind::Server
+                        | ProviderErrorKind::Timeout(_)
+                );
+                let circuit_state = route.circuit.record(&circuit_key, false, transient);
+                if let Some(audit) = &audit {
+                    audit.store.append_event(&audit.run_id, "provider_circuit", &serde_json::json!({
+                        "candidate_index": candidate_index, "state": format!("{circuit_state:?}").to_ascii_lowercase(),
+                    }))?;
+                }
+                let safe = !observation.stream_committed && !observation.tool_call_seen;
+                if error.kind == ProviderErrorKind::ContextOverflow && !compacted && safe {
+                    compacted = true;
+                    if let Ok(Some(smaller)) =
+                        self.context.compact_for_overflow(&request_messages).await
+                    {
+                        request_messages = smaller;
+                        continue;
+                    }
+                }
+                let mut decision = route.snapshot.retry_policy.decide(
+                    error.kind,
+                    prior_retries,
+                    error.diagnostic.retry_after_ms,
+                    safe,
+                    candidate_index + 1 < route.providers.len(),
+                );
+                if circuit_state == crate::provider::CircuitState::Open
+                    && matches!(decision, RetryDecision::Retry(_))
+                {
+                    decision = if safe && candidate_index + 1 < route.providers.len() {
+                        RetryDecision::Fallback
+                    } else {
+                        RetryDecision::Fail
+                    };
+                }
+                last_error = error;
+                match decision {
+                    RetryDecision::Retry(delay) => {
+                        if let Some(audit) = &audit {
+                            audit.store.append_event(&audit.run_id, "provider_retry", &serde_json::json!({
+                                "candidate_index": candidate_index, "round": round,
+                                "error_kind": last_error.kind, "delay_ms": delay.as_millis() as u64,
+                            }))?;
+                        }
+                        prior_retries += 1;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = cancellation.cancelled() => return Err(RuntimeError::Cancelled.into()),
+                        }
+                    }
+                    RetryDecision::Fallback => {
+                        if let Some(audit) = &audit {
+                            audit.store.append_event(&audit.run_id, "provider_fallback", &serde_json::json!({
+                                "from_candidate_index": candidate_index, "to_candidate_index": candidate_index + 1,
+                                "reason": last_error.kind,
+                            }))?;
+                        }
+                        break;
+                    }
+                    RetryDecision::Fail => return Err(last_error.into()),
+                }
+            }
+        }
+        Err(last_error.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_model_once(
+        &self,
+        provider: &Arc<dyn Provider>,
+        messages: &[Message],
+        specs: &[crate::provider::ToolSpec],
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: &CancellationToken,
+        round: usize,
+        trace_request_id: Option<&str>,
+        timeout: Option<&TimeoutPolicy>,
+        observation: &mut AttemptObservation,
+    ) -> Result<ModelOutput> {
         let request_messages;
-        let messages = if self.provider.capabilities().images {
+        let messages = if provider.capabilities().images {
             messages
         } else {
             request_messages = without_images(messages);
@@ -496,7 +760,7 @@ impl LoopEngine {
         let (provider_events, mut provider_rx) = mpsc::unbounded_channel();
         info!(
             round,
-            provider = %self.provider.api_type(),
+            provider = %provider.api_type(),
             message_count = messages.len(),
             tool_spec_count = specs.len(),
             "开始请求模型"
@@ -506,13 +770,13 @@ impl LoopEngine {
                 timestamp_ms: unix_time_ms(),
                 request_id: request_id.to_owned(),
                 round,
-                provider: self.provider.api_type().to_string(),
+                provider: provider.api_type().to_string(),
                 messages: messages.to_vec(),
                 tools: specs.to_vec(),
             })
             .await;
         }
-        let request = self.provider.chat_stream(messages, specs, provider_events);
+        let request = provider.chat_stream(messages, specs, provider_events);
         tokio::pin!(request);
         let mut assembler = ToolCallAssembler::default();
         let started_at = Instant::now();
@@ -523,6 +787,10 @@ impl LoopEngine {
         };
         let mut thinking = String::new();
         let mut thinking_active = false;
+        let mut phase_deadline =
+            timeout.map(|policy| started_at + std::time::Duration::from_millis(policy.connect_ms));
+        let overall_deadline =
+            timeout.map(|policy| started_at + std::time::Duration::from_millis(policy.overall_ms));
         let provider_result = loop {
             tokio::select! {
                 response = &mut request => {
@@ -538,6 +806,17 @@ impl LoopEngine {
                 },
                 event = provider_rx.recv() => {
                     if let Some(event) = event {
+                        let response_started = observation.response_started;
+                        let first_event = observation.first_event;
+                        observation.observe(&event);
+                        if let Some(policy) = timeout
+                            && (observation.response_started != response_started ||
+                                observation.first_event != first_event || event.is_semantic()) {
+                            let duration = if !observation.first_event {
+                                policy.first_event_ms
+                            } else { policy.stream_idle_ms };
+                            phase_deadline = Some(Instant::now() + std::time::Duration::from_millis(duration));
+                        }
                         consume_provider_event(
                             event,
                             &mut assembler,
@@ -549,8 +828,34 @@ impl LoopEngine {
                     }
                 }
                 _ = cancellation.cancelled() => break Err(RuntimeError::Cancelled.into()),
+                _ = async {
+                    if let Some(deadline) = phase_deadline {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else { std::future::pending::<()>().await; }
+                } => {
+                    let phase = if !observation.response_started { TimeoutPhase::Connect }
+                        else if !observation.first_event { TimeoutPhase::FirstEvent }
+                        else { TimeoutPhase::StreamIdle };
+                    break Err(ProviderError::timeout(phase).into());
+                }
+                _ = async {
+                    if let Some(deadline) = overall_deadline {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    } else { std::future::pending::<()>().await; }
+                } => break Err(ProviderError::timeout(TimeoutPhase::Overall).into()),
             }
         };
+        while let Ok(event) = provider_rx.try_recv() {
+            observation.observe(&event);
+            consume_provider_event(
+                event,
+                &mut assembler,
+                events,
+                &mut thinking,
+                &mut thinking_active,
+                &mut timing,
+            );
+        }
         if let Err(error) = provider_result {
             finish_thinking(events, &mut thinking_active);
             if let Some(request_id) = trace_request_id {
@@ -568,17 +873,12 @@ impl LoopEngine {
             }
             return Err(error);
         }
-        while let Ok(event) = provider_rx.try_recv() {
-            consume_provider_event(
-                event,
-                &mut assembler,
-                events,
-                &mut thinking,
-                &mut thinking_active,
-                &mut timing,
+        finish_thinking(events, &mut thinking_active);
+        if observation.response_started && !observation.protocol_done {
+            return Err(
+                ProviderError::new(ProviderErrorKind::Protocol, "Provider 流未正常结束").into(),
             );
         }
-        finish_thinking(events, &mut thinking_active);
         let response = assembler.finish();
         if let Some(request_id) = trace_request_id {
             self.record_trace(SessionTraceRecord::ModelResponse {
@@ -624,7 +924,6 @@ impl LoopEngine {
                         round,
                         tool_call_id = %call.id,
                         tool = %call.name,
-                        arguments = %call.arguments,
                         "模型生成工具调用"
                     );
                 }
@@ -724,7 +1023,6 @@ impl LoopEngine {
             tool_call_id = %call.id,
             tool = %call.name,
             round,
-            arguments = %call.arguments,
             "准备执行工具"
         );
         emit(
@@ -849,9 +1147,70 @@ fn emit(events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
     }
 }
 
+#[derive(Debug)]
 struct ModelOutput {
     response: Response,
     thinking: Option<String>,
+}
+
+#[derive(Default)]
+struct AttemptObservation {
+    response_started: bool,
+    first_event: bool,
+    first_event_at_ms: Option<i64>,
+    protocol_done: bool,
+    stream_committed: bool,
+    tool_call_seen: bool,
+    output_truncated: bool,
+    usage: Option<ProviderUsage>,
+}
+
+impl AttemptObservation {
+    fn observe(&mut self, event: &ProviderEvent) {
+        match event {
+            ProviderEvent::ResponseStarted => self.response_started = true,
+            ProviderEvent::ProtocolDone => self.protocol_done = true,
+            ProviderEvent::Usage(usage) => self.usage.get_or_insert_default().merge_partial(usage),
+            ProviderEvent::TextDelta(text) | ProviderEvent::ThinkingDelta(text) => {
+                if !text.is_empty() {
+                    self.stream_committed = true;
+                    self.mark_first_event();
+                }
+            }
+            ProviderEvent::ToolCallStarted { .. }
+            | ProviderEvent::ToolCallDelta { .. }
+            | ProviderEvent::ToolCallCompleted { .. }
+            | ProviderEvent::ToolCallFailed(_) => {
+                self.tool_call_seen = true;
+                self.stream_committed = true;
+                self.mark_first_event();
+            }
+            ProviderEvent::OutputTruncated => {
+                self.output_truncated = true;
+                self.mark_first_event();
+            }
+        }
+    }
+
+    fn mark_first_event(&mut self) {
+        if !self.first_event {
+            self.first_event = true;
+            self.first_event_at_ms = Some(unix_time_ms() as i64);
+        }
+    }
+}
+
+fn finish_attempt(
+    audit: &ToolAuditContext,
+    attempt: &mut ProviderAttempt,
+    observation: &AttemptObservation,
+) -> Result<()> {
+    attempt.stream_committed = observation.stream_committed;
+    attempt.first_event_at_ms = observation.first_event_at_ms;
+    attempt.finished_at_ms = Some(unix_time_ms() as i64);
+    attempt.usage = observation.usage.clone();
+    audit.store.finish_provider_attempt(attempt)?;
+    Ok(())
 }
 
 struct StreamTiming {
@@ -1953,5 +2312,651 @@ mod tests {
 
         assert_eq!(answer, "已修正");
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::context::ContextConfig;
+    use crate::daemon::protocol::RequestId;
+    use crate::plan::PlanStore;
+    use crate::provider::wire_tests::{MockHttpResponse, start_mock_http};
+    use crate::provider::{
+        ApiType, CircuitBreaker, ContextPolicySnapshot, RetryPolicy, RouteCandidate, RouteSnapshot,
+    };
+    use crate::storage::{Admission, AdmissionMode, SessionId};
+
+    struct Script {
+        events: Vec<(u64, ProviderEvent)>,
+        error: Option<ProviderError>,
+        hang: bool,
+    }
+
+    struct ScriptedProvider {
+        scripts: Mutex<VecDeque<Script>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedProvider {
+        fn new(scripts: Vec<Script>) -> Arc<Self> {
+            Arc::new(Self {
+                scripts: Mutex::new(scripts.into()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::provider::ToolSpec],
+            sender: mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock 请求超过脚本");
+            for (delay, event) in script.events {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                sender.send(event)?;
+            }
+            if script.hang {
+                std::future::pending::<()>().await;
+            }
+            if let Some(error) = script.error {
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn success(text: &str, usage: Option<ProviderUsage>) -> Script {
+        let mut events = vec![
+            (0, ProviderEvent::ResponseStarted),
+            (0, ProviderEvent::TextDelta(text.into())),
+        ];
+        if let Some(usage) = usage {
+            events.push((0, ProviderEvent::Usage(usage)));
+        }
+        events.push((0, ProviderEvent::ProtocolDone));
+        Script {
+            events,
+            error: None,
+            hang: false,
+        }
+    }
+
+    fn failure(kind: ProviderErrorKind) -> Script {
+        Script {
+            events: vec![(0, ProviderEvent::ResponseStarted)],
+            error: Some(ProviderError::new(kind, "mock Provider 错误")),
+            hang: false,
+        }
+    }
+
+    fn engine(
+        providers: Vec<Arc<dyn Provider>>,
+        retry: RetryPolicy,
+        timeout: TimeoutPolicy,
+    ) -> LoopEngine {
+        let primary = providers[0].clone();
+        let context = ContextManager::new(
+            primary.clone(),
+            std::env::current_dir().unwrap(),
+            ContextConfig {
+                token_budget: 100_000,
+                recent_messages: 1,
+                mild_compression_percent: 60,
+                strong_compression_percent: 85,
+                summary_chunk_tokens: 1000,
+            },
+            Arc::new(PlanStore::memory_only()),
+        )
+        .unwrap();
+        let engine = LoopEngine::ephemeral(primary, ToolRegistry::new(), context, 1);
+        let snapshot = RouteSnapshot {
+            candidates: providers
+                .iter()
+                .enumerate()
+                .map(|(index, _)| RouteCandidate {
+                    profile_id: format!("candidate-{index}"),
+                    api_type: ApiType::OpenaiChat,
+                    model: "mock".into(),
+                    base_url_sha256: "mock".into(),
+                })
+                .collect(),
+            retry_policy: retry,
+            timeout_policy: timeout,
+            context_policy: ContextPolicySnapshot {
+                token_budget: 100_000,
+            },
+            config_generation: 1,
+        };
+        engine.with_route(FrozenRoute {
+            snapshot,
+            providers,
+            circuit: Arc::new(CircuitBreaker::default()),
+        })
+    }
+
+    async fn request(
+        engine: &LoopEngine,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelOutput> {
+        engine
+            .request_model(
+                &[Message::text(Role::User, "private input")],
+                &[],
+                &events,
+                cancellation,
+                1,
+                None,
+            )
+            .await
+    }
+
+    fn no_retry() -> RetryPolicy {
+        RetryPolicy {
+            rate_limit_retries: 0,
+            transport_retries: 0,
+            server_retries: 0,
+            timeout_retries: 0,
+            protocol_retries: 0,
+            max_backoff_ms: 10,
+        }
+    }
+
+    fn short_timeout() -> TimeoutPolicy {
+        TimeoutPolicy {
+            connect_ms: 25,
+            first_event_ms: 25,
+            stream_idle_ms: 25,
+            overall_ms: 300,
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_and_persists_attempt_usage_across_restart() {
+        let provider = ScriptedProvider::new(vec![
+            Script {
+                events: vec![
+                    (0, ProviderEvent::ResponseStarted),
+                    (
+                        0,
+                        ProviderEvent::Usage(ProviderUsage {
+                            input_tokens: Some(3),
+                            ..Default::default()
+                        }),
+                    ),
+                ],
+                error: Some(ProviderError::new(ProviderErrorKind::Server, "mock 503")),
+                hang: false,
+            },
+            success(
+                "完成",
+                Some(ProviderUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        let mut retry = no_retry();
+        retry.server_retries = 1;
+        let engine = engine(vec![provider.clone()], retry, short_timeout());
+        let path = std::env::temp_dir().join(format!(
+            "p4-ledger-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = Arc::new(RunStore::open(&path).unwrap());
+        let Admission::New(run) = store
+            .admit_with_route(
+                SessionId("s".into()),
+                RequestId::Number(1),
+                "input",
+                AdmissionMode::Queue,
+                engine.route.as_ref().map(|route| &route.snapshot),
+            )
+            .unwrap()
+        else {
+            panic!("应该创建 run")
+        };
+        let output = with_tool_audit(
+            store.clone(),
+            run.run_id.clone(),
+            request(&engine, None, &CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.response, Response::Text("完成".into()));
+        assert_eq!(provider.count(), 2);
+        let attempts = store.provider_attempts(&run.run_id).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(attempts[1].status, AttemptStatus::Succeeded);
+        store.finish_provider_attempt(&attempts[1]).unwrap();
+        let mut conflict = attempts[1].clone();
+        conflict.status = AttemptStatus::Failed;
+        assert!(store.finish_provider_attempt(&conflict).is_err());
+        assert_eq!(
+            store.provider_usage(&run.run_id).unwrap().input_tokens,
+            Some(10)
+        );
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        assert_eq!(reopened.provider_attempts(&run.run_id).unwrap().len(), 2);
+        assert_eq!(
+            reopened.provider_usage(&run.run_id).unwrap().output_tokens,
+            Some(2)
+        );
+        assert_eq!(
+            reopened
+                .route_snapshot(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .config_generation,
+            1
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn fallback_requires_no_visible_text_or_partial_tool_call() {
+        let first = ScriptedProvider::new(vec![failure(ProviderErrorKind::Server)]);
+        let second = ScriptedProvider::new(vec![success("备用", None)]);
+        let retry = no_retry();
+        let routed = engine(
+            vec![first.clone(), second.clone()],
+            retry.clone(),
+            short_timeout(),
+        );
+        assert_eq!(
+            request(&routed, None, &CancellationToken::new())
+                .await
+                .unwrap()
+                .response,
+            Response::Text("备用".into())
+        );
+        assert_eq!((first.count(), second.count()), (1, 1));
+
+        for event in [
+            ProviderEvent::TextDelta("部分".into()),
+            ProviderEvent::ToolCallStarted {
+                exec_id: crate::provider::ExecutionIdentity::position(ApiType::OpenaiChat, 0),
+                name: "write".into(),
+            },
+        ] {
+            let first = ScriptedProvider::new(vec![Script {
+                events: vec![(0, ProviderEvent::ResponseStarted), (0, event)],
+                error: Some(ProviderError::new(ProviderErrorKind::Server, "mock 503")),
+                hang: false,
+            }]);
+            let second = ScriptedProvider::new(vec![success("不应执行", None)]);
+            let engine = engine(vec![first, second.clone()], retry.clone(), short_timeout());
+            let error = request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ProviderError>().unwrap().kind,
+                ProviderErrorKind::Server
+            );
+            assert_eq!(second.count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_phases_and_semantic_idle_are_distinct() {
+        let cases = [
+            (vec![], TimeoutPhase::Connect),
+            (
+                vec![
+                    (0, ProviderEvent::ResponseStarted),
+                    (10, ProviderEvent::Usage(ProviderUsage::default())),
+                ],
+                TimeoutPhase::FirstEvent,
+            ),
+            (
+                vec![
+                    (0, ProviderEvent::ResponseStarted),
+                    (0, ProviderEvent::TextDelta("a".into())),
+                ],
+                TimeoutPhase::StreamIdle,
+            ),
+        ];
+        for (events, phase) in cases {
+            let provider = ScriptedProvider::new(vec![Script {
+                events,
+                error: None,
+                hang: true,
+            }]);
+            let engine = engine(vec![provider], no_retry(), short_timeout());
+            let error = request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ProviderError>().unwrap().kind,
+                ProviderErrorKind::Timeout(phase)
+            );
+        }
+        let provider = ScriptedProvider::new(vec![Script {
+            events: vec![],
+            error: None,
+            hang: true,
+        }]);
+        let overall_engine = engine(
+            vec![provider],
+            no_retry(),
+            TimeoutPolicy {
+                connect_ms: 100,
+                first_event_ms: 100,
+                stream_idle_ms: 100,
+                overall_ms: 15,
+            },
+        );
+        let error = request(&overall_engine, None, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().kind,
+            ProviderErrorKind::Timeout(TimeoutPhase::Overall)
+        );
+        let provider = ScriptedProvider::new(vec![Script {
+            events: vec![
+                (0, ProviderEvent::ResponseStarted),
+                (0, ProviderEvent::TextDelta("a".into())),
+                (15, ProviderEvent::TextDelta("b".into())),
+                (15, ProviderEvent::TextDelta("c".into())),
+                (0, ProviderEvent::ProtocolDone),
+            ],
+            error: None,
+            hang: false,
+        }]);
+        let engine = engine(vec![provider], no_retry(), short_timeout());
+        assert_eq!(
+            request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap()
+                .response,
+            Response::Text("abc".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_connection_stream_and_backoff() {
+        for events in [
+            vec![],
+            vec![(0, ProviderEvent::ResponseStarted)],
+            vec![
+                (0, ProviderEvent::ResponseStarted),
+                (0, ProviderEvent::TextDelta("a".into())),
+            ],
+        ] {
+            let provider = ScriptedProvider::new(vec![Script {
+                events,
+                error: None,
+                hang: true,
+            }]);
+            let engine = engine(
+                vec![provider],
+                no_retry(),
+                TimeoutPolicy {
+                    connect_ms: 1000,
+                    first_event_ms: 1000,
+                    stream_idle_ms: 1000,
+                    overall_ms: 2000,
+                },
+            );
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancel.cancel();
+            });
+            let error = request(&engine, None, &token).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ProviderError>().unwrap().kind,
+                ProviderErrorKind::Cancelled
+            );
+        }
+        let provider = ScriptedProvider::new(vec![failure(ProviderErrorKind::Server)]);
+        let mut retry = no_retry();
+        retry.server_retries = 1;
+        retry.max_backoff_ms = 1000;
+        let engine = engine(vec![provider.clone()], retry, short_timeout());
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        let _ = request(&engine, None, &token).await.unwrap_err();
+        assert_eq!(provider.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_once_and_never_loops() {
+        let provider = ScriptedProvider::new(vec![
+            failure(ProviderErrorKind::ContextOverflow),
+            success("摘要", None),
+            failure(ProviderErrorKind::ContextOverflow),
+        ]);
+        let engine = engine(vec![provider.clone()], no_retry(), short_timeout());
+        let messages = [
+            Message::text(Role::System, "很长的旧系统说明".repeat(100)),
+            Message::text(Role::User, "很长的旧对话".repeat(100)),
+            Message::text(Role::User, "现在的请求"),
+        ];
+        let error = engine
+            .request_model(&messages, &[], &None, &CancellationToken::new(), 1, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderError>().unwrap().kind,
+            ProviderErrorKind::ContextOverflow
+        );
+        assert_eq!(provider.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn empty_reasoning_truncated_and_protocol_eof_are_distinct() {
+        let cases = [
+            (
+                vec![ProviderEvent::ResponseStarted, ProviderEvent::ProtocolDone],
+                ProviderErrorKind::EmptyCompletion,
+            ),
+            (
+                vec![
+                    ProviderEvent::ResponseStarted,
+                    ProviderEvent::ThinkingDelta("内部思考".into()),
+                    ProviderEvent::ProtocolDone,
+                ],
+                ProviderErrorKind::ReasoningOnly,
+            ),
+            (
+                vec![
+                    ProviderEvent::ResponseStarted,
+                    ProviderEvent::TextDelta("部分".into()),
+                    ProviderEvent::OutputTruncated,
+                    ProviderEvent::ProtocolDone,
+                ],
+                ProviderErrorKind::OutputTruncated,
+            ),
+            (
+                vec![
+                    ProviderEvent::ResponseStarted,
+                    ProviderEvent::TextDelta("部分".into()),
+                ],
+                ProviderErrorKind::Protocol,
+            ),
+        ];
+        for (events, kind) in cases {
+            let provider = ScriptedProvider::new(vec![Script {
+                events: events.into_iter().map(|event| (0, event)).collect(),
+                error: None,
+                hang: false,
+            }]);
+            let engine = engine(vec![provider], no_retry(), short_timeout());
+            let error = request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.downcast_ref::<ProviderError>().unwrap().kind, kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_http_5xx_and_rate_limit_follow_retry_budget() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"成功\"}}]}\n\ndata: [DONE]\n\n";
+        let (url, mut requests) = start_mock_http(vec![
+            MockHttpResponse::error(500, "", r#"{"error":{"code":"server_error"}}"#),
+            MockHttpResponse::error(503, "", r#"{"error":{"code":"server_error"}}"#),
+            MockHttpResponse::sse(sse),
+        ])
+        .await;
+        let provider: Arc<dyn Provider> = Arc::new(crate::provider::OpenAiProvider::new(
+            "key".into(),
+            url,
+            "model".into(),
+        ));
+        let mut retry = no_retry();
+        retry.server_retries = 2;
+        retry.max_backoff_ms = 1;
+        let first_engine = engine(
+            vec![provider],
+            retry,
+            TimeoutPolicy {
+                connect_ms: 1000,
+                first_event_ms: 1000,
+                stream_idle_ms: 1000,
+                overall_ms: 2000,
+            },
+        );
+        assert_eq!(
+            request(&first_engine, None, &CancellationToken::new())
+                .await
+                .unwrap()
+                .response,
+            Response::Text("成功".into())
+        );
+        for _ in 0..3 {
+            requests.recv().await.expect("应按预算请求三次");
+        }
+
+        let (url, mut requests) = start_mock_http(vec![
+            MockHttpResponse::error(
+                429,
+                "Retry-After: 0\r\n",
+                r#"{"error":{"code":"rate_limit"}}"#,
+            ),
+            MockHttpResponse::sse(sse),
+        ])
+        .await;
+        let provider: Arc<dyn Provider> = Arc::new(crate::provider::OpenAiProvider::new(
+            "key".into(),
+            url,
+            "model".into(),
+        ));
+        let mut retry = no_retry();
+        retry.rate_limit_retries = 1;
+        let engine = engine(
+            vec![provider],
+            retry,
+            TimeoutPolicy {
+                connect_ms: 1000,
+                first_event_ms: 1000,
+                stream_idle_ms: 1000,
+                overall_ms: 2000,
+            },
+        );
+        assert_eq!(
+            request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap()
+                .response,
+            Response::Text("成功".into())
+        );
+        for _ in 0..2 {
+            requests.recv().await.expect("应按 Retry-After 重试一次");
+        }
+    }
+
+    async fn stalled_http_stream(first_delta: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let size = socket.read(&mut buffer).await.unwrap();
+                if size == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&buffer[..size]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            if first_delta {
+                let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+                socket
+                    .write_all(format!("{:X}\r\n{payload}\r\n", payload.len()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn real_http_headers_without_events_and_idle_after_text_have_different_timeouts() {
+        for (first_delta, phase) in [
+            (false, TimeoutPhase::FirstEvent),
+            (true, TimeoutPhase::StreamIdle),
+        ] {
+            let (url, task) = stalled_http_stream(first_delta).await;
+            let provider: Arc<dyn Provider> = Arc::new(crate::provider::OpenAiProvider::new(
+                "key".into(),
+                url,
+                "model".into(),
+            ));
+            let engine = engine(
+                vec![provider],
+                no_retry(),
+                TimeoutPolicy {
+                    connect_ms: 100,
+                    first_event_ms: 30,
+                    stream_idle_ms: 30,
+                    overall_ms: 500,
+                },
+            );
+            let error = request(&engine, None, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ProviderError>().unwrap().kind,
+                ProviderErrorKind::Timeout(phase)
+            );
+            task.abort();
+        }
     }
 }

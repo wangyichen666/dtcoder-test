@@ -340,6 +340,29 @@ impl DaemonState {
                     });
                 send_result(&frames, request.id, result);
             }
+            "run.provider_attempts" => {
+                let result = parse_params::<RunReadParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        let attempts = self
+                            .run_store
+                            .provider_attempts(&params.run_id)
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+                        let usage = self
+                            .run_store
+                            .provider_usage(&params.run_id)
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+                        let route = self
+                            .run_store
+                            .route_snapshot(&params.run_id)
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+                        let final_candidate_index =
+                            attempts.last().map(|attempt| attempt.candidate_index);
+                        Ok(json!({"route": route, "attempts": attempts, "usage": usage,
+                            "final_candidate_index": final_candidate_index}))
+                    });
+                send_result(&frames, request.id, result);
+            }
             "run.audit" => {
                 let result = match parse_params::<RunReadParams>(&request.params) {
                     Ok(params) => self.audit_run(&params.run_id).await,
@@ -472,11 +495,16 @@ impl DaemonState {
                 return;
             }
         };
-        let admitted = match self.run_store.admit_with_mode(
+        let frozen_route = self
+            .provider_manager
+            .as_ref()
+            .map(|manager| manager.freeze(session.engine.token_budget()));
+        let admitted = match self.run_store.admit_with_route(
             SessionId(session_id.clone()),
             request.id.clone(),
             &params.message,
             mode,
+            frozen_route.as_ref().map(|route| &route.snapshot),
         ) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -490,7 +518,15 @@ impl DaemonState {
             }
         };
         let run_record = match admitted {
-            Admission::New(run) => run,
+            Admission::New(run) => {
+                if let Some(route) = frozen_route {
+                    self.frozen_routes
+                        .lock()
+                        .await
+                        .insert(run.run_id.clone(), route);
+                }
+                run
+            }
             Admission::Existing(run) => {
                 if run.status == RunStatus::Completed {
                     send_result(
@@ -548,6 +584,7 @@ impl DaemonState {
             let notified = self.queue_notify.notified();
             if cancellation.is_cancelled() {
                 self.active.lock().await.remove(&active_key);
+                self.frozen_routes.lock().await.remove(&run_record.run_id);
                 send_result(
                     &frames,
                     request.id,
@@ -578,6 +615,58 @@ impl DaemonState {
             }
         }
 
+        let route = if let Some(route) = self.frozen_routes.lock().await.remove(&run_record.run_id)
+        {
+            Some(route)
+        } else {
+            match self.run_store.route_snapshot(&run_record.run_id) {
+                Ok(Some(snapshot)) => {
+                    let restore = self
+                        .provider_manager
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("ProviderManager 不可用"))
+                        .and_then(|manager| {
+                            let mut profiles = self.config_store.load()?.profiles;
+                            profiles.push(manager.profile());
+                            manager.restore(snapshot, &profiles)
+                        });
+                    match restore {
+                        Ok(route) => Some(route),
+                        Err(error) => {
+                            let _ = self.run_store.finish(
+                                &run_record.run_id,
+                                RunStatus::Failed,
+                                None,
+                                Some((-32002, "冻结 Provider 配置无法恢复")),
+                            );
+                            self.active.lock().await.remove(&active_key);
+                            send_result(
+                                &frames,
+                                request.id,
+                                Err((
+                                    INTERNAL_ERROR,
+                                    format!("冻结 Provider 配置无法恢复: {error}"),
+                                )),
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    self.active.lock().await.remove(&active_key);
+                    send_result(
+                        &frames,
+                        request.id,
+                        Err((INTERNAL_ERROR, error.to_string())),
+                    );
+                    return;
+                }
+            }
+        };
+        let run_engine = route
+            .map(|route| session.engine.with_route(route))
+            .unwrap_or_else(|| (*session.engine).clone());
         let (agent_events, mut event_receiver) = mpsc::unbounded_channel();
         let (approval_events, mut approval_receiver) = mpsc::unbounded_channel();
         let trace_request_id = request_id_label(&request.id);
@@ -595,8 +684,7 @@ impl DaemonState {
                 approval_events,
                 async {
                     let mut history = session.history.lock().await;
-                    session
-                        .engine
+                    run_engine
                         .run_turn_with_events_for_request(
                             &mut history,
                             params.message,
@@ -1027,12 +1115,6 @@ impl DaemonState {
     }
 
     async fn models_use(&self, profile_id: &str) -> Result<Value, (i64, String)> {
-        if self.has_active_turns().await {
-            return Err((
-                REQUEST_CONFLICT,
-                "当前仍有 Agent 任务运行，请等待完成或取消后再切换模型".to_owned(),
-            ));
-        }
         let Some(manager) = &self.provider_manager else {
             return Err((INTERNAL_ERROR, "当前 daemon 未启用模型配置管理".to_owned()));
         };
@@ -1043,6 +1125,25 @@ impl DaemonState {
         manager
             .switch(profile.clone())
             .map_err(|error| (INVALID_PARAMS, format!("加载模型失败：{error:#}")))?;
+        let config = self
+            .config_store
+            .load()
+            .map_err(|error| (INTERNAL_ERROR, format!("读取备用模型配置失败：{error:#}")))?;
+        manager
+            .set_fallbacks(
+                config
+                    .fallback_profile_ids
+                    .iter()
+                    .filter_map(|id| {
+                        config
+                            .profiles
+                            .iter()
+                            .find(|profile| &profile.id == id)
+                            .cloned()
+                    })
+                    .collect(),
+            )
+            .map_err(|error| (INVALID_PARAMS, format!("加载备用模型失败：{error:#}")))?;
         Ok(json!({
             "changed": true,
             "active_id": profile.id,
@@ -1051,12 +1152,6 @@ impl DaemonState {
     }
 
     async fn models_save(&self, params: ModelSaveParams) -> Result<Value, (i64, String)> {
-        if self.has_active_turns().await {
-            return Err((
-                REQUEST_CONFLICT,
-                "当前仍有 Agent 任务运行，请等待完成或取消后再保存模型配置".to_owned(),
-            ));
-        }
         let Some(manager) = &self.provider_manager else {
             return Err((INTERNAL_ERROR, "当前 daemon 未启用模型配置管理".to_owned()));
         };
@@ -1077,6 +1172,21 @@ impl DaemonState {
         manager
             .switch(profile.clone())
             .map_err(|error| (INVALID_PARAMS, format!("加载模型失败：{error:#}")))?;
+        manager
+            .set_fallbacks(
+                config
+                    .fallback_profile_ids
+                    .iter()
+                    .filter_map(|id| {
+                        config
+                            .profiles
+                            .iter()
+                            .find(|profile| &profile.id == id)
+                            .cloned()
+                    })
+                    .collect(),
+            )
+            .map_err(|error| (INVALID_PARAMS, format!("加载备用模型失败：{error:#}")))?;
         Ok(json!({
             "changed": true,
             "active_id": profile.id,

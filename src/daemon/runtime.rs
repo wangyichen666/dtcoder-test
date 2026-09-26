@@ -34,6 +34,19 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
             )
         })?;
     let provider_manager = Arc::new(ProviderManager::new(profile)?);
+    let configured = config_store.load()?;
+    let fallback_profiles = configured
+        .fallback_profile_ids
+        .iter()
+        .filter_map(|id| {
+            configured
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == id)
+                .cloned()
+        })
+        .collect();
+    provider_manager.set_fallbacks(fallback_profiles)?;
     let provider: Arc<dyn Provider> = provider_manager.clone();
     let approvals = ApprovalBroker::new();
     let safety = Arc::new(SafetyPolicy::new(workspace, Arc::new(approvals.clone()))?);

@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::{
-    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent, Role,
-    ToolArgumentsFragment, ToolCallStreamError, ToolSpec, outbound_wire_id, required_env,
-    send_event,
+    ApiType, ExecutionIdentity, Message, Provider, ProviderCapabilities, ProviderEvent,
+    ProviderUsage, Role, ToolArgumentsFragment, ToolCallStreamError, ToolSpec, outbound_wire_id,
+    required_env, send_event,
 };
 
 pub struct OpenAiProvider {
@@ -119,6 +119,7 @@ impl OpenAiProvider {
             "model": self.model,
             "messages": Self::request_messages(messages),
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if !tools.is_empty() {
             payload["tools"] = Value::Array(Self::request_tools(tools));
@@ -151,13 +152,12 @@ impl Provider for OpenAiProvider {
             .json(&self.request_payload(messages, tools))
             .send()
             .await
-            .context("调用 LLM 服务失败")?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.context("读取 LLM 错误响应失败")?;
-            anyhow::bail!("LLM 服务返回 {status}: {body}");
-        }
-        parse_sse(response, &events).await
+            .map_err(|error| super::ProviderError::from_reqwest(&error))?;
+        let response = super::checked_response(response).await?;
+        send_event(&events, ProviderEvent::ResponseStarted)?;
+        parse_sse(response, &events)
+            .await
+            .map_err(super::sanitize_provider_error)
     }
 }
 
@@ -176,20 +176,35 @@ async fn parse_sse(
     let mut stream = response.bytes_stream();
     let mut pending_bytes = Vec::new();
     let mut calls = BTreeMap::new();
+    let mut done = false;
     while let Some(chunk) = stream.next().await {
-        pending_bytes.extend_from_slice(&chunk.context("读取 LLM 流式响应失败")?);
+        pending_bytes.extend_from_slice(&chunk.map_err(super::stream_transport_error)?);
         while let Some(newline) = pending_bytes.iter().position(|byte| *byte == b'\n') {
             let mut line = pending_bytes.drain(..=newline).collect::<Vec<u8>>();
             while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
+            done |= line
+                .strip_prefix(b"data:")
+                .is_some_and(|data| data.trim_ascii() == b"[DONE]");
             consume_sse_line(&line, &mut calls, events)?;
         }
     }
     if !pending_bytes.is_empty() {
+        done |= pending_bytes
+            .strip_prefix(b"data:")
+            .is_some_and(|data| data.trim_ascii() == b"[DONE]");
         consume_sse_line(&pending_bytes, &mut calls, events)?;
     }
-    complete_calls(calls, events)
+    if !done {
+        return Err(super::ProviderError::new(
+            super::ProviderErrorKind::Protocol,
+            "OpenAI 流缺少结束标记",
+        )
+        .into());
+    }
+    complete_calls(calls, events)?;
+    send_event(events, ProviderEvent::ProtocolDone)
 }
 
 fn consume_sse_line(
@@ -209,12 +224,26 @@ fn consume_sse_line(
     if let Some(usage) = chunk.usage {
         debug!(
             provider = "openai-chat",
-            input_tokens = usage.prompt_tokens,
-            output_tokens = usage.completion_tokens,
+            input_tokens = usage.prompt_tokens.unwrap_or(0),
+            output_tokens = usage.completion_tokens.unwrap_or(0),
             cache_read_input_tokens = usage.cache_hit_tokens(),
             cache_creation_input_tokens = usage.prompt_cache_miss_tokens.unwrap_or(0),
             "LLM token 用量"
         );
+        send_event(
+            events,
+            ProviderEvent::Usage(ProviderUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cache_read_tokens: usage.prompt_cache_hit_tokens.or_else(|| {
+                    usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|details| details.cached_tokens)
+                }),
+                cache_creation_tokens: usage.prompt_cache_miss_tokens,
+            }),
+        )?;
     }
     for choice in chunk.choices {
         if let Some(thinking) = choice.delta.thinking
@@ -360,10 +389,8 @@ struct StreamChunk {
 
 #[derive(Deserialize)]
 struct StreamUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
     prompt_tokens_details: Option<PromptTokenDetails>,
     prompt_cache_hit_tokens: Option<u64>,
     prompt_cache_miss_tokens: Option<u64>,

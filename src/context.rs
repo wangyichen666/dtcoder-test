@@ -64,6 +64,22 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
+    pub fn token_budget(&self) -> usize {
+        self.config.token_budget
+    }
+
+    pub fn with_provider(&self, provider: Arc<dyn Provider>) -> Self {
+        let mut copy = self.clone();
+        copy.provider = provider;
+        copy
+    }
+
+    pub fn with_token_budget(&self, token_budget: usize) -> Self {
+        let mut copy = self.clone();
+        copy.config.token_budget = token_budget;
+        copy
+    }
+
     #[cfg(test)]
     pub fn new(
         provider: Arc<dyn Provider>,
@@ -253,6 +269,21 @@ impl ContextManager {
         ));
         history.extend(recent);
         Ok(())
+    }
+
+    /// 上游明确报告上下文溢出时，仅在本轮请求副本上压缩一次。
+    pub async fn compact_for_overflow(&self, messages: &[Message]) -> Result<Option<Vec<Message>>> {
+        if messages.len() <= 2 {
+            return Ok(None);
+        }
+        let mut compacted = messages.to_vec();
+        self.compress_history(&mut compacted, CompressionMode::Strong)
+            .await?;
+        if estimate_messages(&compacted) < estimate_messages(messages) {
+            Ok(Some(compacted))
+        } else {
+            Ok(None)
+        }
     }
 
     fn summarize_text<'a>(

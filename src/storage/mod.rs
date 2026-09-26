@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::daemon::protocol::RequestId;
-use crate::provider::ToolCall;
+use crate::provider::{AttemptStatus, ProviderAttempt, ProviderUsage, RouteSnapshot, ToolCall};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -191,7 +191,7 @@ impl RunStore {
             [],
             |row| row.get(0),
         )?;
-        if version > 3 {
+        if version > 4 {
             return Err(RuntimeError::Protocol(format!(
                 "SQLite schema 版本 {version} 比当前程序支持的版本新"
             )));
@@ -258,6 +258,16 @@ impl RunStore {
                 COMMIT;",
             )?;
         }
+        if version < 4 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE run_routes(run_id TEXT PRIMARY KEY REFERENCES runs(id), snapshot_json TEXT NOT NULL);
+                CREATE TABLE provider_attempts(attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+                    round INTEGER NOT NULL, candidate_index INTEGER NOT NULL, status TEXT NOT NULL, data_json TEXT NOT NULL);
+                CREATE INDEX provider_attempts_run ON provider_attempts(run_id, round, attempt_id);
+                INSERT INTO schema_migrations(version, applied_at_ms)
+                    VALUES (4, CAST(strftime('%s','now') AS INTEGER) * 1000);
+                COMMIT;")?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             artifact_dir: path.with_extension("artifacts"),
@@ -274,12 +284,24 @@ impl RunStore {
         self.admit_with_mode(session_id, request_id, input, AdmissionMode::Queue)
     }
 
+    #[cfg(test)]
     pub fn admit_with_mode(
         &self,
         session_id: SessionId,
         request_id: RequestId,
         input: &str,
         mode: AdmissionMode,
+    ) -> Result<Admission, RuntimeError> {
+        self.admit_with_route(session_id, request_id, input, mode, None)
+    }
+
+    pub fn admit_with_route(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        input: &str,
+        mode: AdmissionMode,
+        route: Option<&RouteSnapshot>,
     ) -> Result<Admission, RuntimeError> {
         let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
         let transaction = connection.transaction()?;
@@ -332,6 +354,14 @@ impl RunStore {
             "INSERT INTO turns(id, run_id, status) VALUES (?1, ?2, 'queued')",
             params![turn_id.0, run_id.0],
         )?;
+        if let Some(route) = route {
+            let serialized = serde_json::to_string(route)
+                .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+            transaction.execute(
+                "INSERT INTO run_routes(run_id, snapshot_json) VALUES (?1, ?2)",
+                params![run_id.0, serialized],
+            )?;
+        }
         insert_event(
             &transaction,
             &run_id,
@@ -370,6 +400,19 @@ impl RunStore {
             params![run_id.0, now_ms()],
         )?;
         if changed == 1 {
+            let created_at_ms: i64 = transaction.query_row(
+                "SELECT created_at_ms FROM runs WHERE id=?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )?;
+            insert_event(
+                &transaction,
+                run_id,
+                "run_started",
+                &serde_json::json!({
+                    "queue_wait_ms": now_ms().saturating_sub(created_at_ms),
+                }),
+            )?;
             transaction.execute(
                 "UPDATE turns SET status='running' WHERE run_id=?1",
                 params![run_id.0],
@@ -828,11 +871,27 @@ impl RunStore {
                 &serde_json::json!({"content": content}),
             )?;
         }
+        let provider_error_kind = if status == RunStatus::Failed {
+            let raw: Option<String> = transaction.query_row(
+                "SELECT data_json FROM provider_attempts WHERE run_id=?1 ORDER BY rowid DESC LIMIT 1",
+                params![run_id.0], |row| row.get::<_, String>(0),
+            ).optional()?;
+            raw.map(|data| {
+                serde_json::from_str::<ProviderAttempt>(&data).map_err(|error| {
+                    RuntimeError::Protocol(format!("provider attempt 无效: {error}"))
+                })
+            })
+            .transpose()?
+            .and_then(|attempt| attempt.error_kind)
+        } else {
+            None
+        };
         insert_event(
             &transaction,
             run_id,
             "terminal",
-            &serde_json::json!({"status": status, "error_code": error.map(|item| item.0), "error_message": error.map(|item| item.1)}),
+            &serde_json::json!({"status": status, "error_code": error.map(|item| item.0),
+                "error_message": error.map(|item| item.1), "provider_error_kind": provider_error_kind}),
         )?;
         transaction.execute("UPDATE runs SET status=?2, content=?3, error_code=?4, error_message=?5, updated_at_ms=?6 WHERE id=?1",
             params![run_id.0, status.as_str(), content, error.map(|item| item.0), error.map(|item| item.1), now_ms()])?;
@@ -925,6 +984,113 @@ impl RunStore {
             &self.connection.lock().expect("SQLite mutex poisoned"),
             &run_id.0,
         )
+    }
+
+    pub fn route_snapshot(&self, run_id: &RunId) -> Result<Option<RouteSnapshot>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let raw: Option<String> = connection
+            .query_row(
+                "SELECT snapshot_json FROM run_routes WHERE run_id=?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| RuntimeError::Protocol(format!("route snapshot 无效: {error}")))
+        })
+        .transpose()
+    }
+
+    pub fn start_provider_attempt(&self, attempt: &ProviderAttempt) -> Result<(), RuntimeError> {
+        if attempt.status != AttemptStatus::Started {
+            return Err(RuntimeError::Protocol(
+                "attempt 初始状态必须为 started".into(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let tx = connection.transaction()?;
+        let data = serde_json::to_string(attempt)
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        tx.execute("INSERT INTO provider_attempts(attempt_id,run_id,round,candidate_index,status,data_json) VALUES (?1,?2,?3,?4,'started',?5)",
+            params![attempt.attempt_id, attempt.run_id.0, attempt.round, attempt.candidate_index, data])?;
+        insert_event(
+            &tx,
+            &attempt.run_id,
+            "provider_attempt_started",
+            &serde_json::json!({
+                "attempt_id": attempt.attempt_id, "round": attempt.round, "candidate_index": attempt.candidate_index,
+                "profile_id": attempt.provider_profile_id, "model": attempt.model,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_provider_attempt(&self, attempt: &ProviderAttempt) -> Result<(), RuntimeError> {
+        if attempt.status == AttemptStatus::Started {
+            return Err(RuntimeError::Protocol("attempt 终态无效".into()));
+        }
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let tx = connection.transaction()?;
+        let old: String = tx.query_row(
+            "SELECT data_json FROM provider_attempts WHERE attempt_id=?1",
+            params![attempt.attempt_id],
+            |row| row.get(0),
+        )?;
+        let previous: ProviderAttempt = serde_json::from_str(&old)
+            .map_err(|error| RuntimeError::Protocol(error.to_string()))?;
+        let data = serde_json::to_string(attempt)
+            .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        if previous.status != AttemptStatus::Started {
+            if serde_json::from_str::<Value>(&old).ok() == serde_json::from_str::<Value>(&data).ok()
+            {
+                return Ok(());
+            }
+            return Err(RuntimeError::Protocol("attempt 终态冲突".into()));
+        }
+        if previous.run_id != attempt.run_id
+            || previous.round != attempt.round
+            || previous.candidate_index != attempt.candidate_index
+        {
+            return Err(RuntimeError::Protocol("attempt owner 冲突".into()));
+        }
+        tx.execute("UPDATE provider_attempts SET status=?2,data_json=?3 WHERE attempt_id=?1 AND status='started'",
+            params![attempt.attempt_id, format!("{:?}", attempt.status).to_ascii_lowercase(), data])?;
+        insert_event(
+            &tx,
+            &attempt.run_id,
+            "provider_attempt_terminal",
+            &serde_json::json!({
+                "attempt_id": attempt.attempt_id, "status": attempt.status, "error_kind": attempt.error_kind,
+                "retry_after_ms": attempt.retry_after_ms, "stream_committed": attempt.stream_committed,
+                "first_event_at_ms": attempt.first_event_at_ms, "finished_at_ms": attempt.finished_at_ms,
+                "usage": attempt.usage,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn provider_attempts(&self, run_id: &RunId) -> Result<Vec<ProviderAttempt>, RuntimeError> {
+        let connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let mut stmt = connection
+            .prepare("SELECT data_json FROM provider_attempts WHERE run_id=?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![run_id.0], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            serde_json::from_str(&row?).map_err(|error| RuntimeError::Protocol(error.to_string()))
+        })
+        .collect()
+    }
+
+    pub fn provider_usage(&self, run_id: &RunId) -> Result<ProviderUsage, RuntimeError> {
+        let mut total = ProviderUsage::default();
+        for attempt in self.provider_attempts(run_id)? {
+            if let Some(usage) = &attempt.usage {
+                total.add_attempt(usage);
+            }
+        }
+        Ok(total)
     }
 
     pub fn find_request(

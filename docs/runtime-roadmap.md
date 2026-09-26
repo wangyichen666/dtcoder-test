@@ -10,7 +10,8 @@
 | P1 持久 Run | 已完成本阶段 | 工具回执、`run.audit`、显式 `run.reconcile`、崩溃窗口与旧库迁移测试 | JSONL 只是诊断；未知副作用不重放 |
 | P2 控制面 | 已完成本阶段 | 持久队列、exact 取消、approval interaction、resync、受管请求任务与关闭收敛 | 不恢复已消失的 LLM future；question/plan 仅预留 payload；不实现 steer |
 | P3 | Native 纵切完成 | 文件能力、原子写入、流式有界 exec、资源登记与关闭清理 | Docker backend、后台进程另行实施 |
-| P4–P8 | 未开始 | 保持现有 Provider、子 Agent 和工具行为 | 按需求文档顺序实施 |
+| P4 Provider 韧性 | 已完成本阶段纵切 | 类型化错误、冻结路由、attempt/usage 持久化、阶段超时、安全重试 | 后续按风险项扩展真实服务兼容测试 |
+| P5/P7/P6/P9/P10 | 未开始 | 保持现有子 Agent、上下文与工具治理行为 | 按新需求顺序实施 |
 
 本轮在原 `RunStore` 上添加 v2/v3 前进迁移。v2 让工具回执按 `(run_id, round, call_id)` 唯一，新增 effect、参数 SHA-256 摘要、起止时间、typed outcome、artifact 引用和 replay 标志；队列加唯一索引、session 状态索引，interaction 加 revision。完整工具输出经原子写入 `.my-agent/runtime.artifacts/`，SQLite 回执只保留有界预览和摘要。v3 为 interaction 增加类型化 payload。旧 v1 数据原地保留并回填 queued run；未来版本继续 fail closed。
 
@@ -49,7 +50,13 @@
 
 ## 下一步顺序
 
-P1/P2 的人工 repair、受管任务关闭和审批取消副作用测试已完成。P3 Native 纵切已落地；下一步可增加 Docker backend 与后台进程管理，然后按 P4 处理 Provider 韧性。本轮不自动重放 unknown run，也不把 JSONL 当作终态权威。
+P1/P2 的人工 repair、受管任务关闭和审批取消副作用测试已完成。P3 Native 纵切和 P4 Provider 韧性已落地。下一阶段按用户给定顺序进入 P5 异步子 Agent；本轮不自动重放 unknown run，也不把 JSONL 当作终态权威。
+
+## P4 本轮范围与验收
+
+基线为 `a3243ed`，开始时工作区干净；Rust/Cargo 为 1.98.1。`cargo fmt --all -- --check`、`cargo test --all-targets`、严格 clippy、release build 和 `git diff --check` 可运行。代码核对确认热切换 `ProviderManager` 在每次模型请求时重新取当前实现，HTTP 适配器直接返回含响应正文的 anyhow 错误，usage 只进入 tracing，流等待缺少连接、首语义事件和 idle 的独立时限。
+
+本轮仅实现 P4：在现有 Provider/LoopEngine/RunStore 上增加类型化错误、不可变 route snapshot、持久 attempt/usage、阶段超时和有限重试。v4 SQLite 前进迁移新增 `run_routes` 和 `provider_attempts`，`run.provider_attempts` 读回快照、尝试与聚合用量。每个 run 冻结候选实现和模型；运行时热切换只影响新 run。脚本化 HTTP mock 验证分类、脱敏和 usage；脚本化 Provider 验证 retry/fallback、阶段时钟、取消、上下文溢出、终态分类、重启 readback。P5 异步委派、P7 checkpoint、P6 调度、P9 隔离/存储和 P10 远程 MCP 本轮不实施。
 
 ## P3 本轮范围与边界
 
@@ -69,4 +76,4 @@ git diff --check
 
 `tests/runtime_contract.rs` 使用本地 mock Ollama 和真实 daemon 进程，不需要 API key。测试检查终态重启读回、未知 run 不重放、排队请求断线 readback、exact queued cancel、旧幂等键、重启后 queued run 恢复；CLI `/run`、ACP `/run`、WebSocket `run.read` 核对同一 run。单元/契约测试覆盖 v1 原地迁移、未来版本拒绝、工具崩溃窗口、单写者、interaction owner/revision/幂等与订阅 resync 游标。
 
-本轮 181 个单元测试和 2 个进程契约测试通过；`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo build --release`、`git diff --check` 均通过。覆盖显式人工修复的 owner/seq CAS、Unix 真实关闭收敛、审批取消竞争（副作用已开始时不得确认取消）、路径替换/硬链接/内容漂移、命令包装与替换、孙进程取消及输出洪水。P4 及后续尚未实施。
+P3 基线为 181 个单元测试和 2 个进程契约测试。P4 当前 198 个单元测试和 2 个进程契约测试通过，格式检查、严格 Clippy、release 构建及 `git diff --check` 均通过。P5 及后续尚未实施。

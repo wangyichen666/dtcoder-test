@@ -1,12 +1,18 @@
 mod anthropic;
+mod attempt;
+mod circuit;
+mod error;
 mod ollama;
 mod openai;
+mod retry;
+mod route;
 #[cfg(test)]
-mod wire_tests;
+pub(crate) mod wire_tests;
 
 use std::env;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use anyhow::{Context, Result, bail};
@@ -18,8 +24,44 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub use anthropic::AnthropicProvider;
+pub use attempt::{AttemptStatus, ProviderAttempt, ProviderUsage};
+pub use circuit::{CircuitBreaker, CircuitState};
+pub use error::{ProviderDiagnostic, ProviderError, ProviderErrorKind, TimeoutPhase};
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
+pub use retry::{RetryDecision, RetryPolicy};
+pub use route::{ContextPolicySnapshot, FrozenRoute, RouteCandidate, RouteSnapshot, TimeoutPolicy};
+
+async fn checked_response(mut response: reqwest::Response) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = match response.chunk().await {
+        Ok(Some(chunk)) => String::from_utf8_lossy(&chunk[..chunk.len().min(4096)]).into_owned(),
+        _ => String::new(),
+    };
+    Err(ProviderError::from_http(status, &headers, &body).into())
+}
+
+fn sanitize_provider_error(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<ProviderError>().is_some() {
+        return error;
+    }
+    if let Some(reqwest) = error.downcast_ref::<reqwest::Error>() {
+        return ProviderError::from_reqwest(reqwest).into();
+    }
+    ProviderError::new(ProviderErrorKind::Protocol, "Provider 协议数据无效").into()
+}
+
+fn stream_transport_error(error: reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        ProviderError::timeout(TimeoutPhase::StreamIdle)
+    } else {
+        ProviderError::new(ProviderErrorKind::Transport, "Provider 流读取失败")
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -235,6 +277,9 @@ struct ProviderSnapshot {
 /// 这个稳定的 trait object，切换只替换内部实现，不会让已有 Session 失效。
 pub struct ProviderManager {
     current: RwLock<ProviderSnapshot>,
+    fallbacks: RwLock<Vec<ProviderSnapshot>>,
+    generation: AtomicU64,
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl ProviderManager {
@@ -243,6 +288,9 @@ impl ProviderManager {
         let provider: Arc<dyn Provider> = Arc::from(build_provider_from_profile(&profile)?);
         Ok(Self {
             current: RwLock::new(ProviderSnapshot { profile, provider }),
+            fallbacks: RwLock::new(Vec::new()),
+            generation: AtomicU64::new(1),
+            circuit: Arc::new(CircuitBreaker::default()),
         })
     }
 
@@ -264,7 +312,64 @@ impl ProviderManager {
             Ok(mut guard) => *guard = ProviderSnapshot { profile, provider },
             Err(poisoned) => *poisoned.into_inner() = ProviderSnapshot { profile, provider },
         }
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn set_fallbacks(&self, profiles: Vec<ProviderProfile>) -> Result<()> {
+        let mut fallbacks = Vec::new();
+        let active_id = self.profile().id;
+        let mut seen = std::collections::HashSet::new();
+        for profile in profiles {
+            if profile.id == active_id || !seen.insert(profile.id.clone()) {
+                continue;
+            }
+            profile.validate()?;
+            let provider: Arc<dyn Provider> = Arc::from(build_provider_from_profile(&profile)?);
+            fallbacks.push(ProviderSnapshot { profile, provider });
+        }
+        match self.fallbacks.write() {
+            Ok(mut guard) => *guard = fallbacks,
+            Err(poisoned) => *poisoned.into_inner() = fallbacks,
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn freeze(&self, token_budget: usize) -> FrozenRoute {
+        let current = self.read();
+        let fallbacks = match self.fallbacks.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let candidates = std::iter::once(&*current)
+            .chain(fallbacks.iter())
+            .collect::<Vec<_>>();
+        FrozenRoute {
+            snapshot: RouteSnapshot {
+                candidates: candidates
+                    .iter()
+                    .map(|item| RouteCandidate::from_profile(&item.profile))
+                    .collect(),
+                retry_policy: RetryPolicy::default(),
+                timeout_policy: TimeoutPolicy::default(),
+                context_policy: ContextPolicySnapshot { token_budget },
+                config_generation: self.generation.load(Ordering::SeqCst),
+            },
+            providers: candidates
+                .iter()
+                .map(|item| item.provider.clone())
+                .collect(),
+            circuit: self.circuit.clone(),
+        }
+    }
+
+    pub fn restore(
+        &self,
+        snapshot: RouteSnapshot,
+        profiles: &[ProviderProfile],
+    ) -> Result<FrozenRoute> {
+        FrozenRoute::restore(snapshot, profiles, self.circuit.clone())
     }
 }
 
@@ -436,6 +541,9 @@ impl ToolCallStreamError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderEvent {
+    ResponseStarted,
+    ProtocolDone,
+    Usage(ProviderUsage),
     TextDelta(String),
     ThinkingDelta(String),
     /// Provider 因输出 token 上限截断了本轮响应。
@@ -452,6 +560,21 @@ pub enum ProviderEvent {
         exec_id: ExecutionIdentity,
     },
     ToolCallFailed(ToolCallStreamError),
+}
+
+impl ProviderEvent {
+    pub fn is_semantic(&self) -> bool {
+        matches!(self,
+            Self::TextDelta(text) | Self::ThinkingDelta(text) if !text.is_empty()
+        ) || matches!(
+            self,
+            Self::ToolCallStarted { .. }
+                | Self::ToolCallDelta { .. }
+                | Self::ToolCallCompleted { .. }
+                | Self::ToolCallFailed(_)
+                | Self::OutputTruncated
+        )
+    }
 }
 
 #[async_trait]
@@ -641,5 +764,32 @@ mod tests {
         manager.switch(second).unwrap();
         assert_eq!(manager.profile().model, "llama3");
         assert_eq!(manager.api_type(), ApiType::Ollama);
+    }
+
+    #[test]
+    fn frozen_route_keeps_old_candidate_after_hot_switch_and_never_stores_key() {
+        let first = ProviderProfile {
+            id: "first".into(),
+            name: "first".into(),
+            api_type: ApiType::OpenaiChat,
+            api_key: Some("never-persist-this-key".into()),
+            base_url: "http://127.0.0.1:12345".into(),
+            model: "model-a".into(),
+        };
+        let second = ProviderProfile {
+            id: "second".into(),
+            model: "model-b".into(),
+            ..first.clone()
+        };
+        let manager = ProviderManager::new(first).unwrap();
+        let old = manager.freeze(8192);
+        manager.switch(second).unwrap();
+        let new = manager.freeze(8192);
+        assert_eq!(old.snapshot.candidates[0].model, "model-a");
+        assert_eq!(new.snapshot.candidates[0].model, "model-b");
+        assert!(new.snapshot.config_generation > old.snapshot.config_generation);
+        let serialized = serde_json::to_string(&old.snapshot).unwrap();
+        assert!(!serialized.contains("never-persist-this-key"));
+        assert!(!serialized.contains("127.0.0.1"));
     }
 }

@@ -64,6 +64,99 @@ async fn ollama_mock_closes_tool_result_round_trip() {
     assert_wire_round_trip(&provider, requests, "\"role\":\"tool\"").await;
 }
 
+#[tokio::test]
+async fn http_error_classification_and_redaction() {
+    for (status, kind) in [
+        (401, ProviderErrorKind::Auth),
+        (403, ProviderErrorKind::AccessDenied),
+        (429, ProviderErrorKind::RateLimit),
+        (500, ProviderErrorKind::Server),
+        (503, ProviderErrorKind::Server),
+    ] {
+        let (url, mut requests) = start_mock_http(vec![MockHttpResponse::error(
+            status,
+            "Retry-After: 0\r\nx-request-id: safe-request-123\r\n",
+            r#"{"error":{"code":"upstream_error","message":"super-secret-provider-body"}}"#,
+        )])
+        .await;
+        let provider = OpenAiProvider::new("test-secret-key".into(), url, "model".into());
+        let error = collect_provider_response(
+            &provider,
+            &[Message::text(Role::User, "private prompt")],
+            &[],
+        )
+        .await
+        .expect_err("HTTP 错误不应视为成功");
+        let typed = error
+            .downcast_ref::<ProviderError>()
+            .expect("必须保留类型化错误");
+        assert_eq!(typed.kind, kind);
+        assert_eq!(typed.diagnostic.http_status, Some(status));
+        assert_eq!(typed.diagnostic.retry_after_ms, Some(0));
+        assert_eq!(
+            typed.diagnostic.request_id.as_deref(),
+            Some("safe-request-123")
+        );
+        let decision =
+            RetryPolicy::default().decide(kind, 0, typed.diagnostic.retry_after_ms, true, false);
+        if status == 429 {
+            assert_eq!(decision, RetryDecision::Retry(std::time::Duration::ZERO));
+        } else if status == 401 || status == 403 {
+            assert_eq!(decision, RetryDecision::Fail);
+        }
+        let diagnostic = serde_json::to_string(&typed.diagnostic).unwrap();
+        for secret in [
+            "test-secret-key",
+            "super-secret-provider-body",
+            "private prompt",
+            "Authorization",
+        ] {
+            assert!(!diagnostic.contains(secret));
+            assert!(!format!("{error:#}").contains(secret));
+        }
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains("Bearer test-secret-key"));
+    }
+}
+
+#[tokio::test]
+async fn refused_connection_is_transport_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let provider = OpenAiProvider::new("test-key".into(), url, "model".into());
+    let error = collect_provider_response(&provider, &[Message::text(Role::User, "hello")], &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ProviderError>().unwrap().kind,
+        ProviderErrorKind::Transport
+    );
+}
+
+#[tokio::test]
+async fn openai_usage_is_emitted_without_fabricating_missing_fields() {
+    let (url, _requests) = start_mock_http(vec![MockHttpResponse::sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
+        "data: [DONE]\n\n"
+    ))]).await;
+    let provider = OpenAiProvider::new("key".into(), url, "model".into());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    provider
+        .chat_stream(&[Message::text(Role::User, "hello")], &[], sender)
+        .await
+        .unwrap();
+    let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.contains(&ProviderEvent::Usage(ProviderUsage {
+        input_tokens: Some(7),
+        output_tokens: Some(2),
+        cache_read_tokens: Some(3),
+        cache_creation_tokens: None,
+    })));
+    assert!(events.contains(&ProviderEvent::ProtocolDone));
+}
+
 async fn assert_wire_round_trip(
     provider: &dyn Provider,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -101,14 +194,18 @@ async fn assert_wire_round_trip(
     );
 }
 
-struct MockHttpResponse {
+pub(crate) struct MockHttpResponse {
+    status: u16,
+    extra_headers: String,
     content_type: &'static str,
     body: String,
 }
 
 impl MockHttpResponse {
-    fn sse(body: impl Into<String>) -> Self {
+    pub(crate) fn sse(body: impl Into<String>) -> Self {
         Self {
+            status: 200,
+            extra_headers: String::new(),
             content_type: "text/event-stream",
             body: body.into(),
         }
@@ -116,13 +213,24 @@ impl MockHttpResponse {
 
     fn ndjson(body: impl Into<String>) -> Self {
         Self {
+            status: 200,
+            extra_headers: String::new(),
             content_type: "application/x-ndjson",
             body: body.into(),
         }
     }
+
+    pub(crate) fn error(status: u16, headers: &str, body: &str) -> Self {
+        Self {
+            status,
+            extra_headers: headers.to_owned(),
+            content_type: "application/json",
+            body: body.to_owned(),
+        }
+    }
 }
 
-async fn start_mock_http(
+pub(crate) async fn start_mock_http(
     responses: Vec<MockHttpResponse>,
 ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -138,8 +246,10 @@ async fn start_mock_http(
                 .expect("读取 mock 请求失败");
             requests.send(request).expect("保存 mock 请求失败");
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {} Mock\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                response.status,
                 response.content_type,
+                response.extra_headers,
                 response.body.len()
             );
             stream

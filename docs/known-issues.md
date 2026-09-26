@@ -52,3 +52,10 @@
 - TUI-002：Ctrl+T 展开/折叠时保存 transcript 顶部锚点，详情继续在原消息流内渲染，不再自动跳到底部。
 - TUI-003：新增运行阶段状态和不确定进度动画；模型等待、流式输出、工具执行期间持续更新，审批、完成、失败或中断时停止动画并显示对应终态。
 - 验证：TUI 定向测试、全量测试、严格 Clippy、格式检查、release 构建及隔离 PTY 烟雾测试均通过。
+
+## P4 Provider 韧性剩余边界
+
+- 熔断状态仅在当前 daemon 进程内维护；重启会重新从 closed 开始。route 与 attempt 已持久化，但已开始的 LLM future 不会自动恢复。
+- OpenAI 兼容服务需要接受 `stream_options.include_usage` 才能返回结构化用量；拒绝该字段的服务会按 `InvalidRequest` 失败，需针对该服务调整配置或适配器。真实商业 API 端到端兼容性尚未用密钥测试。
+- `ContextOverflow` 只对本轮输入副本进行一次现有摘要式压缩；摘要生成失败或压缩未缩小时保留原输入并返回类型化溢出错误。持久 compact projection 留待 P7。
+- queued run 在 daemon 重启后仍按已持久 route 恢复；若配置 ID、模型或 URL 摘要已改变，按 fail closed 结束，避免静默切换。API key 轮换可用相同配置 ID 和路由元数据恢复。

@@ -343,6 +343,24 @@ async fn committed_terminal_survives_real_daemon_restart_and_uncertain_run_is_no
         .await;
         assert_eq!(complete["result"]["status"], "completed");
         assert_eq!(complete["result"]["content"], "已完成");
+        let provider_ledger = rpc(
+            &socket,
+            "provider-ledger",
+            "run.provider_attempts",
+            json!({"run_id":complete_id}),
+        )
+        .await;
+        assert_eq!(
+            provider_ledger["result"]["route"]["candidates"][0]["model"],
+            "mock"
+        );
+        assert_eq!(
+            provider_ledger["result"]["attempts"][0]["status"],
+            "succeeded"
+        );
+        assert_eq!(provider_ledger["result"]["usage"]["input_tokens"], 2);
+        assert_eq!(provider_ledger["result"]["usage"]["output_tokens"], 2);
+        assert!(!provider_ledger.to_string().contains("api_key"));
         let unknown = rpc(
             &socket,
             "read-unknown",
