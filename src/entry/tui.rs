@@ -930,11 +930,13 @@ async fn handle_key(client: &DaemonClient, state: &mut TuiState, key: KeyEvent) 
             }
             state.record_history(&message);
         }
-        None if let KeyCode::Char(character) = key.code
-            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            state.input.insert(character);
-            state.reset_slash_selection();
+        None => {
+            if let KeyCode::Char(character) = key.code
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                state.input.insert(character);
+                state.reset_slash_selection();
+            }
         }
         _ => {}
     }
@@ -1010,6 +1012,16 @@ async fn handle_frame(state: &mut TuiState, turn_id: &RequestId, frame: ServerFr
                 state.set_turn_phase(turn_id, ActivityPhase::WaitingModel);
             }
             EventKind::TurnCompleted => {}
+            EventKind::DelegationSpawned | EventKind::DelegationTerminal => {
+                state.push_text(
+                    Role::System,
+                    format!(
+                        "子 Agent {} · {}",
+                        event.data["child_run_id"].as_str().unwrap_or("?"),
+                        event.data["status"].as_str().unwrap_or("?")
+                    ),
+                );
+            }
         },
         ServerFrame::Response(response) => {
             state

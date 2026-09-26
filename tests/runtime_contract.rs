@@ -61,6 +61,121 @@ async fn mock_ollama() -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>
     (url, task, count)
 }
 
+async fn mock_delegation_ollama(
+    completed: Vec<usize>,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = count.clone();
+    let completed = Arc::new(completed);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let served = requests.fetch_add(1, Ordering::SeqCst) + 1;
+            let completed = completed.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !completed.contains(&served) {
+                    std::future::pending::<()>().await;
+                }
+                let body = "{\"message\":{\"role\":\"assistant\",\"content\":\"子任务完成\"},\"done\":false}\n{\"done\":true,\"prompt_eval_count\":2,\"eval_count\":2}\n";
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()).as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (url, task, count)
+}
+
+async fn mock_tool_spawn_ollama() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let served = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = if served == 1 {
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"spawn_subagent\",\"arguments\":{\"task\":\"核对一个问题\"}}}]},\"done\":false}\n{\"done\":true}\n"
+                } else {
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"完成\"},\"done\":false}\n{\"done\":true}\n"
+                };
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()).as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (url, task)
+}
+
+async fn mock_child_outside_read_ollama(
+    release: Arc<tokio::sync::Notify>,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = count.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let served = requests.fetch_add(1, Ordering::SeqCst) + 1;
+            let release = release.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if served == 1 {
+                    std::future::pending::<()>().await;
+                }
+                let body = if served == 2 {
+                    release.notified().await;
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"/etc/hosts\"}}}]},\"done\":false}\n{\"done\":true}\n"
+                } else {
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"已核对\"},\"done\":false}\n{\"done\":true}\n"
+                };
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()).as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (url, task, count)
+}
+
 async fn daemon(workspace: &Path, runtime_dir: &Path, url: &str) -> (Child, PathBuf) {
     let child = Command::new(env!("CARGO_BIN_EXE_my-agent"))
         .arg("--workspace")
@@ -149,7 +264,14 @@ async fn send_and_disconnect(socket: &Path, id: &str, session: &str, message: &s
     stream.write_all(format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"chat.send","params":{"session_id":session,"message":message}})).as_bytes()).await.unwrap();
 }
 
-async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &str) {
+async fn entry_views(
+    workspace: &Path,
+    runtime_dir: &Path,
+    url: &str,
+    run_id: &str,
+    expected_content: &str,
+    subagent_parent: Option<&str>,
+) {
     let mut cli = Command::new(env!("CARGO_BIN_EXE_my-agent"))
         .arg("--workspace")
         .arg(workspace)
@@ -167,7 +289,16 @@ async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &s
     cli.stdin
         .take()
         .unwrap()
-        .write_all(format!("/run {run_id}\n/exit\n").as_bytes())
+        .write_all(
+            format!(
+                "/run {run_id}\n{}{}/exit\n",
+                subagent_parent.map_or(String::new(), |parent| format!(
+                    "/subagent {parent} {run_id}\n"
+                )),
+                ""
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let output = cli.wait_with_output().await.unwrap();
@@ -180,7 +311,8 @@ async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &s
     assert!(
         cli_text.contains(&format!("run_id={run_id}"))
             && cli_text.contains("status=completed")
-            && cli_text.contains("已完成"),
+            && cli_text.contains(expected_content)
+            && subagent_parent.is_none_or(|_| cli_text.contains(&format!("child_run_id={run_id}"))),
         "{cli_text}"
     );
 
@@ -236,9 +368,35 @@ async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &s
     assert!(
         acp_text.contains(&format!("run_id={run_id}"))
             && acp_text.contains("status=completed")
-            && acp_text.contains("已完成"),
+            && acp_text.contains(expected_content),
         "{acp_text}"
     );
+    if let Some(parent) = subagent_parent {
+        acp_in
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":4,
+            "method":"session/prompt","params":{"sessionId":acp_session,
+            "prompt":[{"type":"text","text":format!("/subagent {parent} {run_id}")}]}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut child_text = String::new();
+        loop {
+            let line = acp_out.next_line().await.unwrap().unwrap();
+            child_text.push_str(&line);
+            if serde_json::from_str::<Value>(&line).unwrap()["id"] == 4 {
+                break;
+            }
+        }
+        assert!(
+            child_text.contains(&format!("child_run_id={run_id}")),
+            "{child_text}"
+        );
+    }
     acp.kill().await.unwrap();
     acp.wait().await.unwrap();
 
@@ -301,7 +459,29 @@ async fn entry_views(workspace: &Path, runtime_dir: &Path, url: &str, run_id: &s
     };
     assert_eq!(web_result["result"]["run_id"], run_id);
     assert_eq!(web_result["result"]["status"], "completed");
-    assert_eq!(web_result["result"]["content"], "已完成");
+    assert_eq!(web_result["result"]["content"], expected_content);
+    if let Some(parent) = subagent_parent {
+        socket
+            .send(WsMessage::Text(
+                json!({"jsonrpc":"2.0","id":"web-child",
+            "method":"read_subagent","params":{"parent_run_id":parent,"child_run_id":run_id}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let child_view = loop {
+            let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["id"] == "web-child" {
+                break value;
+            }
+        };
+        assert_eq!(
+            child_view["result"]["child"]["child_run_id"], run_id,
+            "{child_view}"
+        );
+    }
     web.kill().await.unwrap();
     web.wait().await.unwrap();
 }
@@ -396,7 +576,7 @@ async fn committed_terminal_survives_real_daemon_restart_and_uncertain_run_is_no
         )
         .await;
         assert_eq!(duplicate["result"]["run_id"], complete_id);
-        entry_views(&workspace, &runtime_dir, &url, &complete_id).await;
+        entry_views(&workspace, &runtime_dir, &url, &complete_id, "已完成", None).await;
         restarted.kill().await.unwrap();
         restarted.wait().await.unwrap();
         server.abort();
@@ -483,4 +663,425 @@ async fn daemon_queue_is_durable_and_exact_cancel_does_not_hit_running_run() {
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(runtime_dir);
     }).await.expect("queue contract timed out");
+}
+
+#[tokio::test]
+async fn durable_subagent_spawn_wait_restart_and_scoped_cancel() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!("/tmp/ma-child-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)));
+        let (url, server, provider_requests) = mock_delegation_ollama(vec![2]).await;
+        let (mut daemon_process, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
+            .as_str().unwrap().to_owned();
+        let (parent, _) = chat(&socket, "parent", &session, "等待", false).await;
+        for _ in 0..100 {
+            if provider_requests.load(Ordering::SeqCst) >= 1 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let spawned = rpc(&socket, "spawn", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"first",
+            "task":"调查一个问题"})).await;
+        assert!(spawned.get("result").is_some(), "{spawned}");
+        let child = spawned["result"]["child"]["child_run_id"].as_str().unwrap().to_owned();
+        let child_session = spawned["result"]["child"]["child_session_id"].as_str().unwrap().to_owned();
+        assert_ne!(child_session, session);
+        let timed_out = rpc(&socket, "wait-short", "wait_subagents", json!({
+            "parent_run_id":parent,"child_run_ids":[child],"timeout_ms":0})).await;
+        assert_eq!(timed_out["result"]["timed_out"], true, "{timed_out}");
+        let checkpoint = rpc(&socket, "checkpoint", "wait_subagents", json!({
+            "parent_run_id":parent,"child_run_ids":[child],"after_seq":0,"timeout_ms":1000})).await;
+        assert_eq!(checkpoint["result"]["checkpoints"][0]["child_run_id"], child);
+        let completed = rpc(&socket, "wait", "wait_subagents", json!({
+            "parent_run_id":parent,"child_run_ids":[child],"timeout_ms":5000})).await;
+        assert_eq!(completed["result"]["children"][0]["status"], "completed", "{completed}");
+        assert_eq!(completed["result"]["children"][0]["content"], "子任务完成");
+        assert_eq!(rpc(&socket, "parent-read", "run.read", json!({"run_id":parent})).await["result"]["status"], "running");
+        let duplicate = rpc(&socket, "spawn-retry", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"first",
+            "task":"调查一个问题"})).await;
+        assert_eq!(duplicate["result"]["child"]["child_run_id"], child, "{duplicate}");
+        let stolen = rpc(&socket, "wrong-scope", "cancel_subagent", json!({
+            "parent_run_id":"run-does-not-own","child_run_id":child})).await;
+        assert!(stolen.get("error").is_some());
+        let elevated_tool = rpc(&socket, "elevate-tool", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"bad-tool",
+            "task":"越权","tools":["exec"]})).await;
+        assert!(elevated_tool.get("error").is_some());
+        let elevated_tokens = rpc(&socket, "elevate-budget", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"bad-budget",
+            "task":"越权","max_tokens":500000})).await;
+        assert!(elevated_tokens.get("error").is_some());
+        let reserved = rpc(&socket, "reserve", "subagent.result.reserve", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-a","revision":0})).await;
+        assert_eq!(reserved["result"]["child"]["result_state"], "reserved", "{reserved}");
+        let reserved_again = rpc(&socket, "reserve-again", "subagent.result.reserve", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-a","revision":0})).await;
+        assert_eq!(reserved_again["result"]["child"]["revision"], 1);
+        let conflicted = rpc(&socket, "reserve-conflict", "subagent.result.reserve", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-b","revision":1})).await;
+        assert!(conflicted.get("error").is_some());
+        let released = rpc(&socket, "release", "subagent.result.release", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-a","revision":1})).await;
+        assert_eq!(released["result"]["child"]["result_state"], "unconsumed");
+        let reserved_b = rpc(&socket, "reserve-b", "subagent.result.reserve", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-b","revision":2})).await;
+        assert_eq!(reserved_b["result"]["child"]["revision"], 3);
+        let delivered = rpc(&socket, "commit", "subagent.result.commit", json!({
+            "parent_run_id":parent,"child_run_id":child,"owner":"reader-b","revision":3})).await;
+        assert_eq!(delivered["result"]["child"]["result_state"], "delivered");
+        let second = rpc(&socket, "spawn-second", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"second",
+            "task":"持续调查"})).await;
+        assert!(second.get("result").is_some(), "{second}");
+        let second_id = second["result"]["child"]["child_run_id"].as_str().unwrap().to_owned();
+        for _ in 0..100 {
+            if provider_requests.load(Ordering::SeqCst) >= 3 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let other_session = rpc(&socket, "new-other", "session.new", json!({})).await
+            ["result"]["session_id"].as_str().unwrap().to_owned();
+        let (unrelated, _) = chat(&socket, "unrelated", &other_session, "另一个根任务", false).await;
+        for _ in 0..100 {
+            if provider_requests.load(Ordering::SeqCst) >= 4 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let cancelled = rpc(&socket, "cancel-root", "agent.cancel", json!({
+            "session_id":session,"run_id":parent})).await;
+        assert_eq!(cancelled["result"]["cancelled"], true, "{cancelled}");
+        for _ in 0..100 {
+            let status = rpc(&socket, "second-read", "run.read", json!({"run_id":second_id})).await;
+            if status["result"]["status"] == "cancelled" { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rpc(&socket, "second-final", "run.read", json!({"run_id":second_id})).await["result"]["status"], "cancelled");
+        assert_eq!(rpc(&socket, "unrelated-read", "run.read", json!({"run_id":unrelated})).await["result"]["status"], "running");
+        let late_spawn = rpc(&socket, "late-spawn", "spawn_subagent", json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"after-cancel",
+            "task":"不能再创建"})).await;
+        assert!(late_spawn.get("error").is_some(), "{late_spawn}");
+        daemon_process.kill().await.unwrap(); daemon_process.wait().await.unwrap();
+        let (mut restarted, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let listed = rpc(&socket, "list", "list_subagents", json!({"root_run_id":parent})).await;
+        assert_eq!(listed["result"]["children"][0]["child_run_id"], child);
+        assert_eq!(listed["result"]["children"][0]["status"], "completed");
+        assert_eq!(listed["result"]["children"][0]["result_state"], "delivered");
+        assert_eq!(rpc(&socket, "second-restarted", "run.read", json!({"run_id":second_id})).await["result"]["status"], "cancelled");
+        assert_eq!(rpc(&socket, "unrelated-unknown", "run.read", json!({"run_id":unrelated})).await["result"]["status"], "unknown_after_restart");
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 4);
+        entry_views(&workspace, &runtime_dir, &url, &child, "子任务完成", Some(&parent)).await;
+        restarted.kill().await.unwrap(); restarted.wait().await.unwrap(); server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    }).await.expect("subagent contract timed out");
+}
+
+#[tokio::test]
+async fn running_subagent_becomes_unknown_after_daemon_crash_without_replay() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!(
+            "/tmp/ma-child-crash-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (url, server, requests) = mock_delegation_ollama(vec![2]).await;
+        let (mut daemon_process, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (parent, _) = chat(&socket, "parent", &session, "等待", false).await;
+        for _ in 0..100 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = rpc(
+            &socket,
+            "first",
+            "spawn_subagent",
+            json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"first",
+            "task":"完成"}),
+        )
+        .await;
+        let first_id = first["result"]["child"]["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = rpc(
+            &socket,
+            "wait-first",
+            "wait_subagents",
+            json!({
+            "parent_run_id":parent,"child_run_ids":[first_id],"timeout_ms":5000}),
+        )
+        .await;
+        let second = rpc(
+            &socket,
+            "second",
+            "spawn_subagent",
+            json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"second",
+            "task":"保持运行"}),
+        )
+        .await;
+        let second_id = second["result"]["child"]["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for _ in 0..100 {
+            if requests.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        daemon_process.kill().await.unwrap();
+        daemon_process.wait().await.unwrap();
+        let (mut restarted, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let unknown = rpc(
+            &socket,
+            "read",
+            "read_subagent",
+            json!({
+            "parent_run_id":parent,"child_run_id":second_id}),
+        )
+        .await;
+        assert_eq!(
+            unknown["result"]["child"]["status"], "unknown_after_restart",
+            "{unknown}"
+        );
+        assert_eq!(unknown["result"]["child"]["result_state"], "unconsumed");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        restarted.kill().await.unwrap();
+        restarted.wait().await.unwrap();
+        server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    })
+    .await
+    .expect("subagent crash contract timed out");
+}
+
+#[tokio::test]
+async fn model_spawn_tool_uses_durable_delegation_and_receipt() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!(
+            "/tmp/ma-child-tool-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (url, server) = mock_tool_spawn_ollama().await;
+        let (mut daemon_process, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (parent, response) = chat(&socket, "parent", &session, "派出子任务", true).await;
+        assert!(response.unwrap().get("result").is_some());
+        let tools = rpc(&socket, "tools", "run.tools", json!({"run_id":parent})).await;
+        assert_eq!(
+            tools["result"]["receipts"][0]["name"], "spawn_subagent",
+            "{tools}"
+        );
+        let listed = rpc(
+            &socket,
+            "list",
+            "list_subagents",
+            json!({"root_run_id":parent}),
+        )
+        .await;
+        assert_eq!(
+            listed["result"]["children"].as_array().unwrap().len(),
+            1,
+            "{listed}"
+        );
+        let child = listed["result"]["children"][0]["child_run_id"]
+            .as_str()
+            .unwrap();
+        let waited = rpc(
+            &socket,
+            "wait",
+            "wait_subagents",
+            json!({
+            "parent_run_id":parent,"child_run_ids":[child],"timeout_ms":5000}),
+        )
+        .await;
+        assert_eq!(
+            waited["result"]["children"][0]["status"], "completed",
+            "{waited}"
+        );
+        daemon_process.kill().await.unwrap();
+        daemon_process.wait().await.unwrap();
+        server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    })
+    .await
+    .expect("model delegation tool contract timed out");
+}
+
+#[tokio::test]
+async fn concurrent_children_finish_and_remain_addressable_by_stable_ids() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!(
+            "/tmp/ma-child-parallel-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (url, server, requests) = mock_delegation_ollama(vec![2, 3]).await;
+        let (mut daemon_process, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (parent, _) = chat(&socket, "parent", &session, "等待", false).await;
+        for _ in 0..100 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = rpc(
+            &socket,
+            "first",
+            "spawn_subagent",
+            json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"a",
+            "task":"任务 A"}),
+        )
+        .await;
+        let second = rpc(
+            &socket,
+            "second",
+            "spawn_subagent",
+            json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"b",
+            "task":"任务 B"}),
+        )
+        .await;
+        let a = first["result"]["child"]["child_run_id"].as_str().unwrap();
+        let b = second["result"]["child"]["child_run_id"].as_str().unwrap();
+        assert_ne!(a, b);
+        let waited = rpc(
+            &socket,
+            "wait",
+            "wait_subagents",
+            json!({
+            "parent_run_id":parent,"child_run_ids":[a,b],"timeout_ms":5000}),
+        )
+        .await;
+        assert_eq!(waited["result"]["children"][0]["child_run_id"], a);
+        assert_eq!(waited["result"]["children"][1]["child_run_id"], b);
+        for id in [a, b] {
+            for _ in 0..100 {
+                let child = rpc(
+                    &socket,
+                    "read",
+                    "read_subagent",
+                    json!({
+                    "parent_run_id":parent,"child_run_id":id}),
+                )
+                .await;
+                if child["result"]["child"]["status"] == "completed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let child = rpc(
+                &socket,
+                "read-final",
+                "read_subagent",
+                json!({
+                "parent_run_id":parent,"child_run_id":id}),
+            )
+            .await;
+            assert_eq!(child["result"]["child"]["content"], "子任务完成");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        daemon_process.kill().await.unwrap();
+        daemon_process.wait().await.unwrap();
+        server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    })
+    .await
+    .expect("parallel delegation contract timed out");
+}
+
+#[tokio::test]
+async fn child_read_permission_stays_frozen_after_parent_mode_changes() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let workspace = temp_workspace();
+        let runtime_dir = PathBuf::from(format!(
+            "/tmp/ma-child-mode-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (url, server, requests) = mock_child_outside_read_ollama(release.clone()).await;
+        let (mut daemon_process, socket) = daemon(&workspace, &runtime_dir, &url).await;
+        let session = rpc(&socket, "new", "session.new", json!({})).await["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (parent, _) = chat(&socket, "parent", &session, "等待", false).await;
+        for _ in 0..100 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let spawned = rpc(
+            &socket,
+            "spawn",
+            "spawn_subagent",
+            json!({
+            "parent_session_id":session,"parent_run_id":parent,"spawn_key":"frozen",
+            "task":"核对文件"}),
+        )
+        .await;
+        assert!(spawned.get("result").is_some(), "{spawned}");
+        let child = spawned["result"]["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let changed = rpc(&socket, "mode", "permissions.set", json!({"mode":"full"})).await;
+        assert!(changed.get("result").is_some(), "{changed}");
+        release.notify_one();
+        let completed = rpc(
+            &socket,
+            "wait",
+            "wait_subagents",
+            json!({
+            "parent_run_id":parent,"child_run_ids":[child],"timeout_ms":5000}),
+        )
+        .await;
+        assert_eq!(
+            completed["result"]["children"][0]["status"], "completed",
+            "{completed}"
+        );
+        let receipts = rpc(&socket, "tools", "run.tools", json!({"run_id":child})).await;
+        assert_eq!(
+            receipts["result"]["receipts"][0]["name"], "read_file",
+            "{receipts}"
+        );
+        assert_eq!(
+            receipts["result"]["receipts"][0]["outcome"], "tool_error",
+            "{receipts}"
+        );
+        daemon_process.kill().await.unwrap();
+        daemon_process.wait().await.unwrap();
+        server.abort();
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    })
+    .await
+    .expect("child permission contract timed out");
 }

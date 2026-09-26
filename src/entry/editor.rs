@@ -244,6 +244,10 @@ async fn run_acp_slash(
         SlashParse::Command(crate::slash::SlashInvocation {
             action: SlashAction::Help
                 | SlashAction::Run
+                | SlashAction::Subagents
+                | SlashAction::Subagent
+                | SlashAction::SubagentWait
+                | SlashAction::SubagentCancel
                 | SlashAction::Status
                 | SlashAction::Sessions
                 | SlashAction::Ping,
@@ -425,6 +429,8 @@ fn forward_event(
         | EventKind::ThinkingFinished
         | EventKind::TurnStarted
         | EventKind::TurnCompleted
+        | EventKind::DelegationSpawned
+        | EventKind::DelegationTerminal
         | EventKind::ApprovalRequired => None,
     };
     if let Some(update) = update {

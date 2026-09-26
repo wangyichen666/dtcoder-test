@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
 
 use super::DaemonState;
 use super::approval::ApprovalBroker;
+use super::delegation_tool::DelegationTool;
 use super::lifecycle::RuntimePaths;
 use crate::config::ConfigStore;
 use crate::context::{ContextConfig, ContextManager};
@@ -20,7 +22,6 @@ use crate::safety::SafetyPolicy;
 use crate::session::SessionStore;
 use crate::skills::SkillLibrary;
 use crate::storage::RunStore;
-use crate::sub_agent::SubAgentTool;
 use crate::tools::{EditFileTool, ExecTool, ReadFileTool, ToolRegistry, WriteFileTool};
 
 pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
@@ -58,15 +59,26 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
     let memory = Arc::new(MemoryStore::from_env(workspace));
     tools.register(RememberTool::new(memory.clone()));
     tools.register(RecallMemoryTool::new(memory.clone()));
-    let sub_agent_tools = tools.clone();
+    let delegation_daemon = Arc::new(OnceLock::new());
     let context_config = ContextConfig::from_env()?;
     let plan = Arc::new(PlanStore::from_env(workspace).await?);
     tools.register(PlanTool::new(plan.clone()));
-    tools.register(SubAgentTool::new(
-        provider.clone(),
-        sub_agent_tools,
-        workspace.to_path_buf(),
-        context_config.clone(),
+    tools.register(DelegationTool::new("sub_agent", delegation_daemon.clone()));
+    tools.register(DelegationTool::new(
+        "spawn_subagent",
+        delegation_daemon.clone(),
+    ));
+    tools.register(DelegationTool::new(
+        "wait_subagents",
+        delegation_daemon.clone(),
+    ));
+    tools.register(DelegationTool::new(
+        "cancel_subagent",
+        delegation_daemon.clone(),
+    ));
+    tools.register(DelegationTool::new(
+        "list_subagents",
+        delegation_daemon.clone(),
     ));
     let skills = SkillLibrary::from_env(workspace);
     skills.refresh().await?;
@@ -131,6 +143,7 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
             run_store,
         ),
     );
+    let _ = delegation_daemon.set(Arc::downgrade(&state));
     for queued in state.run_store.recoverable_queued()? {
         let message = state
             .run_store

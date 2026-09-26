@@ -92,6 +92,8 @@ pub enum EventKind {
     ToolFinished,
     ApprovalRequired,
     TurnCompleted,
+    DelegationSpawned,
+    DelegationTerminal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

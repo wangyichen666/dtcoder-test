@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod delegation_tool;
 pub mod handlers;
 pub mod lifecycle;
 pub mod protocol;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::task::JoinSet;
 
 use self::approval::ApprovalBroker;
@@ -113,6 +114,7 @@ pub(crate) struct ActiveRequest {
     updates: broadcast::Sender<ActiveRequestUpdate>,
     replay: VecDeque<ActiveRequestUpdate>,
     replay_bytes: usize,
+    origin: Option<mpsc::UnboundedSender<ServerFrame>>,
 }
 
 impl ActiveRequest {
@@ -125,6 +127,19 @@ impl ActiveRequest {
             updates,
             replay: VecDeque::new(),
             replay_bytes: 0,
+            origin: None,
+        }
+    }
+
+    pub(crate) fn with_origin(mut self, origin: mpsc::UnboundedSender<ServerFrame>) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    pub(crate) fn publish_external(&mut self, request_id: RequestId, update: ActiveRequestUpdate) {
+        self.publish(update.clone());
+        if let Some(origin) = &self.origin {
+            let _ = origin.send(update.to_frame(request_id));
         }
     }
 

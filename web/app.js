@@ -1297,6 +1297,11 @@
       renderApproval(data.approval);
       addActivity("approval", "等待审批", data.approval?.prompt || "Agent 请求执行受保护操作");
       setAgentStatus("waiting", "待审批");
+    } else if (event === "delegation_spawned" || event === "delegation_terminal") {
+      addActivity("turn", event === "delegation_spawned" ? "已派出子 Agent" : "子 Agent 已结束",
+        `${data.child_run_id || ""} · ${data.status || ""}`);
+      if (!$("#subagent-root").value && frame.run_id) $("#subagent-root").value = frame.run_id;
+      refreshSubagents().catch(() => {});
     }
   }
 
@@ -1369,6 +1374,46 @@
       $("#cancel-turn").disabled = false;
       toast(`停止失败：${error.message}`);
     }
+  }
+
+  async function refreshSubagents() {
+    const root = $("#subagent-root").value.trim() || state.activeRunId;
+    if (!root || !state.connected) { toast("请输入 root run ID 并连接 daemon"); return; }
+    $("#subagent-root").value = root;
+    try {
+      const result = await state.rpc.request("list_subagents", { root_run_id: root }).promise;
+      const children = result.children || [];
+      $("#subagent-list").innerHTML = children.length ? children.map((child) => `
+        <div class="activity-item">
+          <strong>${escapeHtml(child.child_run_id)}</strong> · ${escapeHtml(child.status)}
+          <div>${escapeHtml(child.content || child.error_message || child.child_session_id)}</div>
+          <button type="button" data-child-read="${escapeAttr(child.child_run_id)}">读取</button>
+          <button type="button" data-child-wait="${escapeAttr(child.child_run_id)}">等待</button>
+          <button type="button" data-child-cancel="${escapeAttr(child.child_run_id)}">取消</button>
+        </div>`).join("") : "暂无子 Agent";
+      $$('[data-child-read]').forEach((button) => button.addEventListener("click", async () => {
+        try {
+          const view = await state.rpc.request("read_subagent", { parent_run_id: root,
+            child_run_id: button.dataset.childRead }).promise;
+          toast(`${view.child.child_run_id}：${view.child.status}`);
+          await refreshSubagents();
+        } catch (error) { toast(error.message); }
+      }));
+      $$('[data-child-wait]').forEach((button) => button.addEventListener("click", async () => {
+        try {
+          await state.rpc.request("wait_subagents", { parent_run_id: root,
+            child_run_ids: [button.dataset.childWait], timeout_ms: 1000 }).promise;
+          await refreshSubagents();
+        } catch (error) { toast(error.message); }
+      }));
+      $$('[data-child-cancel]').forEach((button) => button.addEventListener("click", async () => {
+        try {
+          await state.rpc.request("cancel_subagent", { parent_run_id: root,
+            child_run_id: button.dataset.childCancel }).promise;
+          await refreshSubagents();
+        } catch (error) { toast(error.message); }
+      }));
+    } catch (error) { toast(`读取子 Agent 失败：${error.message}`); }
   }
 
   async function continueInspectedSession() {
@@ -1696,6 +1741,7 @@
   });
   $("#new-agent-session").addEventListener("click", newAgentSession);
   $("#cancel-turn").addEventListener("click", cancelTurn);
+  $("#refresh-subagents").addEventListener("click", refreshSubagents);
   $("#inspect-current").addEventListener("click", inspectCurrentAgentSession);
   $("#continue-session").addEventListener("click", continueInspectedSession);
   $("#load-more-messages").addEventListener("click", loadMoreMessages);

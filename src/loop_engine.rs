@@ -20,10 +20,11 @@ use crate::provider::{
 use crate::session::{SessionStore, SessionTraceRecord};
 use crate::storage::{RunId, RunStore, RuntimeError};
 use crate::tool_calls::ToolCallAssembler;
-use crate::tools::{ToolCancellation, ToolOutput, ToolRegistry};
+use crate::tools::{Tool, ToolCancellation, ToolOutput, ToolRegistry};
 
 pub const DEFAULT_PROGRESS_CHECKPOINT_ROUNDS: usize = 50;
 tokio::task_local! { static TOOL_AUDIT: ToolAuditContext; }
+tokio::task_local! { static TOOL_CALL_ID: String; }
 
 #[derive(Clone)]
 struct ToolAuditContext {
@@ -39,6 +40,12 @@ pub async fn with_tool_audit<F: std::future::Future>(
     TOOL_AUDIT
         .scope(ToolAuditContext { store, run_id }, future)
         .await
+}
+
+pub(crate) fn current_tool_owner() -> Option<(RunId, String)> {
+    let run_id = TOOL_AUDIT.try_with(|audit| audit.run_id.clone()).ok()?;
+    let call_id = TOOL_CALL_ID.try_with(Clone::clone).ok()?;
+    Some((run_id, call_id))
 }
 pub const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
 const REPETITION_THRESHOLD: usize = 3;
@@ -128,6 +135,7 @@ pub struct LoopEngine {
     context: ContextManager,
     session: Option<Arc<SessionStore>>,
     round_limit: Option<usize>,
+    total_token_budget: Option<u64>,
     route: Option<FrozenRoute>,
 }
 
@@ -150,10 +158,12 @@ impl LoopEngine {
             // 主任务不使用固定轮次硬上限。复杂任务依靠进度检查点继续运行，
             // 真正的失控则由重复调用与连续失败熔断器识别。
             round_limit: None,
+            total_token_budget: None,
             route: None,
         }
     }
 
+    #[cfg(test)]
     pub fn ephemeral(
         provider: Arc<dyn Provider>,
         tools: ToolRegistry,
@@ -166,6 +176,7 @@ impl LoopEngine {
             context,
             session: None,
             round_limit: Some(max_rounds),
+            total_token_budget: None,
             route: None,
         }
     }
@@ -177,12 +188,35 @@ impl LoopEngine {
             context: self.context.clone(),
             session: Some(session),
             round_limit: self.round_limit,
+            total_token_budget: self.total_token_budget,
             route: self.route.clone(),
         }
     }
 
+    pub fn for_delegation(
+        &self,
+        names: &[String],
+        max_rounds: usize,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.tools = self.tools.subset(names.iter().map(String::as_str))?;
+        copy.round_limit = Some(max_rounds);
+        copy.total_token_budget = Some(max_tokens as u64);
+        copy.context = copy
+            .context
+            .with_token_budget(max_tokens.min(self.context.token_budget()));
+        Ok(copy)
+    }
+
     pub fn token_budget(&self) -> usize {
         self.context.token_budget()
+    }
+
+    pub fn with_tool<T: Tool + 'static>(&self, tool: T) -> Self {
+        let mut copy = self.clone();
+        copy.tools.register(tool);
+        copy
     }
 
     pub fn with_route(&self, route: FrozenRoute) -> Self {
@@ -277,6 +311,7 @@ impl LoopEngine {
         let mut repeat_detector = RepeatDetector::default();
         let mut repetition_reminder = false;
         let mut consecutive_tool_failures = 0usize;
+        let mut estimated_total_tokens = 0u64;
 
         let mut round = 0usize;
         loop {
@@ -320,6 +355,45 @@ impl LoopEngine {
                     trace_request_id,
                 )
                 .await?;
+            if let Some(budget) = self.total_token_budget {
+                let estimate_input = request_messages
+                    .iter()
+                    .map(|message| {
+                        message
+                            .content
+                            .as_deref()
+                            .map_or(0, crate::context::estimate_text_tokens)
+                            as u64
+                    })
+                    .sum::<u64>();
+                let estimate_output = match &output.response {
+                    Response::Text(text) => crate::context::estimate_text_tokens(text) as u64,
+                    Response::ToolCalls(calls) => calls
+                        .iter()
+                        .map(|call| {
+                            crate::context::estimate_text_tokens(&call.arguments.to_string()) as u64
+                        })
+                        .sum(),
+                    Response::ToolAssemblyFailed(_) => 0,
+                };
+                estimated_total_tokens = estimated_total_tokens
+                    .saturating_add(estimate_input.saturating_add(estimate_output));
+                let usage = TOOL_AUDIT
+                    .try_with(|audit| audit.store.provider_usage(&audit.run_id))
+                    .ok()
+                    .transpose()?;
+                let measured = usage.map_or(0, |usage| {
+                    usage
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(usage.output_tokens.unwrap_or(0))
+                });
+                if measured.max(estimated_total_tokens) > budget
+                    && !matches!(output.response, Response::Text(_))
+                {
+                    bail!("子 Agent token 预算已耗尽：上限 {budget}");
+                }
+            }
             match output.response {
                 Response::Text(text) => {
                     self.record(
@@ -1044,9 +1118,15 @@ impl LoopEngine {
             })
             .await;
         }
-        let (result, failed, error_message) = match self
-            .tools
-            .execute_with_cancellation(&call.name, call.arguments.clone(), cancellation)
+        let (result, failed, error_message) = match TOOL_CALL_ID
+            .scope(
+                call.id.clone(),
+                self.tools.execute_with_cancellation(
+                    &call.name,
+                    call.arguments.clone(),
+                    cancellation,
+                ),
+            )
             .await
         {
             Ok(output) => (output, false, None),

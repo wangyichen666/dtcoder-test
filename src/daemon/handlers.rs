@@ -21,13 +21,14 @@ use crate::config::ProfileSummary;
 use crate::cron::ScheduleSpec;
 use crate::loop_engine::{AgentEvent, CancellationToken};
 use crate::provider::ProviderProfile;
-use crate::safety::SafetyMode;
+use crate::safety::{SafetyMode, SafetyPolicy};
 use crate::session::{SessionStatus, SessionTraceRecord};
 use crate::slash::{SlashAction, SlashParse, SlashRegistry, SlashResponse};
 use crate::storage::{
-    Admission, AdmissionMode, EventSeq, InteractionId, RunId, RunStatus, RuntimeError, SessionId,
-    StoredEvent,
+    Admission, AdmissionMode, DelegationRecord, DelegationRequest, EventSeq, InteractionId, RunId,
+    RunStatus, RuntimeError, SessionId, StoredEvent,
 };
+use crate::tools::ReadFileTool;
 
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -38,6 +39,14 @@ const WEB_PAGE_MAX_BYTES: usize = MAX_FRAME_BYTES - 256 * 1024;
 const WEB_PAGE_MAX_ITEM_BYTES: usize = 256 * 1024;
 const WEB_PAGE_DEFAULT_LIMIT: usize = 80;
 const WEB_PAGE_MAX_LIMIT: usize = 200;
+
+struct AbortTimer(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTimer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Deserialize)]
 struct ChatSendParams {
@@ -89,6 +98,53 @@ struct SubscribeParams {
 #[derive(Deserialize)]
 struct RunReadParams {
     run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct SpawnSubagentParams {
+    parent_session_id: SessionId,
+    parent_run_id: RunId,
+    spawn_key: String,
+    task: String,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    max_rounds: Option<i64>,
+    #[serde(default)]
+    max_tokens: Option<i64>,
+    #[serde(default)]
+    max_tool_calls: Option<i64>,
+    #[serde(default)]
+    timeout_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SubagentScopeParams {
+    parent_run_id: RunId,
+    child_run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct SubagentListParams {
+    root_run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct WaitSubagentsParams {
+    parent_run_id: RunId,
+    child_run_ids: Vec<RunId>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    after_seq: Option<EventSeq>,
+}
+
+#[derive(Deserialize)]
+struct SubagentResultParams {
+    parent_run_id: RunId,
+    child_run_id: RunId,
+    owner: String,
+    revision: i64,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +334,90 @@ impl DaemonState {
                 };
                 send_result(&frames, request.id, result);
             }
+            "spawn_subagent" => {
+                let result = match parse_params::<SpawnSubagentParams>(&request.params) {
+                    Ok(params) => self.spawn_subagent(params).await,
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
+                send_result(&frames, request.id, result);
+            }
+            "list_subagents" => {
+                let result = parse_params::<SubagentListParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.run_store
+                            .list_delegations(&params.root_run_id)
+                            .map(|children| json!({"children": children}))
+                            .map_err(|error| (INTERNAL_ERROR, error.to_string()))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "read_subagent" => {
+                let result = parse_params::<SubagentScopeParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.scoped_delegation(&params)
+                            .map(|child| json!({"child": child}))
+                    });
+                send_result(&frames, request.id, result);
+            }
+            "wait_subagents" => {
+                let result = match parse_params::<WaitSubagentsParams>(&request.params) {
+                    Ok(params) => self.wait_subagents(params).await,
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
+                send_result(&frames, request.id, result);
+            }
+            "cancel_subagent" => {
+                let result = match parse_params::<SubagentScopeParams>(&request.params) {
+                    Ok(params) => {
+                        let child = self.scoped_delegation(&params);
+                        match child {
+                            Ok(child) => {
+                                self.cancel(CancelParams {
+                                    request_id: None,
+                                    run_id: Some(child.child_run_id),
+                                    session_id: Some(child.child_session_id.0),
+                                })
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
+                send_result(&frames, request.id, result);
+            }
+            "subagent.result.reserve" | "subagent.result.release" | "subagent.result.commit" => {
+                let result = parse_params::<SubagentResultParams>(&request.params)
+                    .map_err(|error| (INVALID_PARAMS, error))
+                    .and_then(|params| {
+                        self.scoped_delegation(&SubagentScopeParams {
+                            parent_run_id: params.parent_run_id,
+                            child_run_id: params.child_run_id.clone(),
+                        })?;
+                        let child = match request.method.as_str() {
+                            "subagent.result.reserve" => self.run_store.reserve_delegation_result(
+                                &params.child_run_id,
+                                &params.owner,
+                                params.revision,
+                            ),
+                            "subagent.result.release" => self.run_store.release_delegation_result(
+                                &params.child_run_id,
+                                &params.owner,
+                                params.revision,
+                            ),
+                            _ => self.run_store.deliver_delegation_result(
+                                &params.child_run_id,
+                                &params.owner,
+                                params.revision,
+                            ),
+                        }
+                        .map_err(|error| (REQUEST_CONFLICT, error.to_string()))?;
+                        Ok(json!({"child": child}))
+                    });
+                send_result(&frames, request.id, result);
+            }
             "queue.list" => {
                 let result = parse_params::<SessionResumeParams>(&request.params)
                     .map_err(|error| (INVALID_PARAMS, error))
@@ -446,6 +586,314 @@ impl DaemonState {
         }
     }
 
+    pub(crate) async fn spawn_subagent_for_tool(
+        self: &Arc<Self>,
+        parent_run_id: RunId,
+        spawn_key: String,
+        task: String,
+        tools: Option<Vec<String>>,
+    ) -> Result<Value, (i64, String)> {
+        let parent = self
+            .run_store
+            .read_run(&parent_run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .ok_or((INVALID_PARAMS, "父 run 不存在".into()))?;
+        let response = self
+            .spawn_subagent(SpawnSubagentParams {
+                parent_session_id: parent.session_id,
+                parent_run_id,
+                spawn_key,
+                task,
+                tools,
+                max_rounds: None,
+                max_tokens: None,
+                max_tool_calls: None,
+                timeout_ms: None,
+            })
+            .await?;
+        Ok(response["child"].clone())
+    }
+
+    pub(crate) async fn wait_subagents_for_tool(
+        &self,
+        parent_run_id: RunId,
+        child_run_ids: Vec<RunId>,
+        timeout_ms: u64,
+        after_seq: Option<EventSeq>,
+    ) -> Result<Value, (i64, String)> {
+        self.wait_subagents(WaitSubagentsParams {
+            parent_run_id,
+            child_run_ids,
+            timeout_ms: Some(timeout_ms),
+            after_seq,
+        })
+        .await
+    }
+
+    pub(crate) async fn cancel_subagent_for_tool(
+        &self,
+        parent_run_id: RunId,
+        child_run_id: RunId,
+    ) -> Result<Value, (i64, String)> {
+        let child = self.scoped_delegation(&SubagentScopeParams {
+            parent_run_id,
+            child_run_id,
+        })?;
+        self.cancel(CancelParams {
+            request_id: None,
+            run_id: Some(child.child_run_id),
+            session_id: Some(child.child_session_id.0),
+        })
+        .await
+    }
+
+    async fn spawn_subagent(
+        self: &Arc<Self>,
+        params: SpawnSubagentParams,
+    ) -> Result<Value, (i64, String)> {
+        let parent = self
+            .run_store
+            .read_run(&params.parent_run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .ok_or((INVALID_PARAMS, "父 run 不存在".into()))?;
+        if parent.session_id != params.parent_session_id {
+            return Err((REQUEST_CONFLICT, "父 run 不属于指定 session".into()));
+        }
+        let parent_delegation = self
+            .run_store
+            .delegation(&params.parent_run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+        let requested_tools = params.tools.unwrap_or_else(|| vec!["read_file".into()]);
+        // This first durable slice only grants the read-only capability. A child of a
+        // child must also inherit it from its own immutable capability snapshot.
+        if requested_tools.is_empty()
+            || requested_tools.iter().any(|name| name != "read_file")
+            || parent_delegation.as_ref().is_some_and(|record| {
+                requested_tools
+                    .iter()
+                    .any(|name| !record.tools.contains(name))
+            })
+        {
+            return Err((REQUEST_CONFLICT, "子 Agent 只能继承 read_file 能力".into()));
+        }
+        let max_rounds = params.max_rounds.unwrap_or(8);
+        let max_tokens = params.max_tokens.unwrap_or(16_000);
+        let max_tool_calls = params.max_tool_calls.unwrap_or(16);
+        let timeout_ms = params.timeout_ms.unwrap_or(120_000);
+        if !(1..=15).contains(&max_rounds)
+            || !(512..=32_000).contains(&max_tokens)
+            || !(1..=32).contains(&max_tool_calls)
+            || !(1_000..=600_000).contains(&timeout_ms)
+            || parent_delegation.as_ref().is_some_and(|record| {
+                max_rounds > record.max_rounds
+                    || max_tokens > record.max_tokens
+                    || max_tool_calls > record.max_tool_calls
+            })
+        {
+            return Err((INVALID_PARAMS, "子 Agent 预算无效或超过父预算".into()));
+        }
+        let parent_runtime = self
+            .session_runtime(Some(&params.parent_session_id.0))
+            .await?;
+        if max_tokens as usize > parent_runtime.engine.token_budget() {
+            return Err((INVALID_PARAMS, "子 Agent token 预算超过父会话".into()));
+        }
+        parent_runtime
+            .engine
+            .for_delegation(&requested_tools, max_rounds as usize, max_tokens as usize)
+            .map_err(|error| (REQUEST_CONFLICT, error.to_string()))?;
+        let (child_session_id, _) = self
+            .session
+            .create_isolated_session()
+            .map_err(|error| (INTERNAL_ERROR, format!("{error:#}")))?;
+        let cwd = parent_delegation
+            .as_ref()
+            .map(|record| record.cwd.clone())
+            .or_else(|| {
+                self.safety
+                    .as_ref()
+                    .map(|policy| policy.workspace().to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| {
+                self.session
+                    .path_for_session(&parent.session_id.0)
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        // 初期只开放只读能力；即使父会话权限更宽，child 仍冻结为最窄模式。
+        let permission_mode = SafetyMode::RequestApproval.key().to_owned();
+        let deadline_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+            + timeout_ms;
+        let deadline_ms = parent_delegation
+            .as_ref()
+            .map_or(deadline_ms, |record| deadline_ms.min(record.deadline_ms));
+        let guard = self.control_lock.lock().await;
+        let duplicate = self
+            .run_store
+            .delegation_by_spawn_key(&params.parent_run_id, &params.spawn_key)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .is_some();
+        if !duplicate {
+            let key = ActiveKey {
+                session_id: parent.session_id.0.clone(),
+                request_id: parent.request_id.clone(),
+            };
+            let active = self.active.lock().await;
+            if active.get(&key).is_none_or(|request| {
+                request.run_id != parent.run_id || request.cancellation.is_cancelled()
+            }) {
+                return Err((REQUEST_CONFLICT, "父 run 已停止接纳子 Agent".into()));
+            }
+        }
+        let child = self
+            .run_store
+            .admit_delegation(DelegationRequest {
+                parent_session_id: params.parent_session_id,
+                parent_run_id: params.parent_run_id,
+                child_session_id: SessionId(child_session_id),
+                spawn_key: params.spawn_key,
+                task: params.task.clone(),
+                tools: requested_tools,
+                permission_mode,
+                cwd,
+                max_rounds,
+                max_tokens,
+                max_tool_calls,
+                deadline_ms,
+            })
+            .map_err(|error| (REQUEST_CONFLICT, error.to_string()))?;
+        drop(guard);
+        self.notify_delegation_parent(&child, EventKind::DelegationSpawned)
+            .await;
+        if child.status == RunStatus::Queued {
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: RequestId::String(format!("delegation:{}", child.child_session_id.0)),
+                method: "chat.send".into(),
+                params: json!({"session_id": child.child_session_id, "message": params.task}),
+            };
+            let (frames, _receiver) = mpsc::unbounded_channel();
+            let state = self.clone();
+            let accepted = self
+                .spawn_owned(async move {
+                    state.handle_chat_send(request, frames).await;
+                })
+                .await;
+            if !accepted {
+                tracing::warn!(child_run_id = %child.child_run_id.0,
+                    "daemon 关闭中；委派保留 queued，重启后恢复");
+            }
+        }
+        Ok(json!({"child_session_id": child.child_session_id,
+            "child_run_id": child.child_run_id, "status": child.status, "child": child}))
+    }
+
+    fn scoped_delegation(
+        &self,
+        params: &SubagentScopeParams,
+    ) -> Result<DelegationRecord, (i64, String)> {
+        let child = self
+            .run_store
+            .delegation(&params.child_run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .ok_or((INVALID_PARAMS, "子 Agent 不存在".into()))?;
+        if child.parent_run_id != params.parent_run_id && child.root_run_id != params.parent_run_id
+        {
+            return Err((REQUEST_CONFLICT, "child 不属于指定委派作用域".into()));
+        }
+        Ok(child)
+    }
+
+    async fn wait_subagents(&self, params: WaitSubagentsParams) -> Result<Value, (i64, String)> {
+        if params.child_run_ids.is_empty()
+            || params.child_run_ids.len() > 8
+            || params.timeout_ms.unwrap_or(30_000) > 60_000
+        {
+            return Err((INVALID_PARAMS, "等待对象或超时范围无效".into()));
+        }
+        let timeout = std::time::Duration::from_millis(params.timeout_ms.unwrap_or(30_000));
+        let started = Instant::now();
+        loop {
+            let mut children = Vec::with_capacity(params.child_run_ids.len());
+            let mut checkpoints = Vec::new();
+            for child_run_id in &params.child_run_ids {
+                let child = self.scoped_delegation(&SubagentScopeParams {
+                    parent_run_id: params.parent_run_id.clone(),
+                    child_run_id: child_run_id.clone(),
+                })?;
+                if let Some(after_seq) = params.after_seq {
+                    let run = self
+                        .run_store
+                        .read_run(child_run_id)
+                        .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+                        .ok_or((INVALID_PARAMS, "child run 不存在".into()))?;
+                    if run.last_seq.0 > after_seq.0 {
+                        checkpoints
+                            .push(json!({"child_run_id": child_run_id, "last_seq": run.last_seq}));
+                    }
+                }
+                children.push(child);
+            }
+            if !checkpoints.is_empty()
+                || children.iter().any(|child| child.status.terminal())
+                || started.elapsed() >= timeout
+            {
+                return Ok(json!({"timed_out": checkpoints.is_empty()
+                        && !children.iter().any(|child| child.status.terminal()),
+                    "children": children, "checkpoints": checkpoints}));
+            }
+            tokio::time::sleep(
+                std::time::Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
+            )
+            .await;
+        }
+    }
+
+    async fn notify_delegation_parent(&self, child: &DelegationRecord, kind: EventKind) {
+        let Ok(Some(parent)) = self.run_store.read_run(&child.parent_run_id) else {
+            return;
+        };
+        let key = ActiveKey {
+            session_id: parent.session_id.0,
+            request_id: parent.request_id.clone(),
+        };
+        let mut active = self.active.lock().await;
+        if let Some(active) = active.get_mut(&key) {
+            active.publish_external(
+                parent.request_id,
+                ActiveRequestUpdate::Event {
+                    kind,
+                    data: json!({
+                    "child_run_id": child.child_run_id, "child_session_id": child.child_session_id,
+                    "status": child.status, "summary": child.content.as_deref().unwrap_or("")
+                        .chars().take(512).collect::<String>()}),
+                    run_id: Some(child.parent_run_id.clone()),
+                    seq: None,
+                },
+            );
+        }
+    }
+
+    fn frozen_child_read_tool(
+        &self,
+        child: &DelegationRecord,
+    ) -> Result<ReadFileTool, (i64, String)> {
+        let mode = SafetyMode::parse(&child.permission_mode)
+            .ok_or((INTERNAL_ERROR, "委派权限快照无效".into()))?;
+        let policy = Arc::new(
+            SafetyPolicy::new(&child.cwd, Arc::new(self.approvals.clone()))
+                .map_err(|error| (INTERNAL_ERROR, format!("子 Agent cwd 无法恢复: {error:#}")))?,
+        );
+        policy.set_mode(mode);
+        Ok(ReadFileTool::new(policy))
+    }
+
     async fn handle_chat_send(
         self: Arc<Self>,
         request: JsonRpcRequest,
@@ -483,6 +931,53 @@ impl DaemonState {
             }
         };
         let session_id = session.id.clone();
+        let delegation = match self.run_store.delegation_for_session(&session_id) {
+            Ok(record) => record,
+            Err(error) => {
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((INTERNAL_ERROR, error.to_string())),
+                );
+                return;
+            }
+        };
+        let _deadline_timer = if let Some(child) = &delegation {
+            let expected = RequestId::String(format!("delegation:{session_id}"));
+            if request.id != expected {
+                send_result(
+                    &frames,
+                    request.id,
+                    Err((
+                        REQUEST_CONFLICT,
+                        "委派 session 只能由已准入的 child run 驱动".into(),
+                    )),
+                );
+                return;
+            }
+            let remaining = child.deadline_ms.saturating_sub(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64,
+            );
+            let state = self.clone();
+            let child_run_id = child.child_run_id.clone();
+            let child_session_id = child.child_session_id.0.clone();
+            Some(AbortTimer(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(remaining.max(0) as u64)).await;
+                let _ = state
+                    .cancel(CancelParams {
+                        request_id: None,
+                        run_id: Some(child_run_id),
+                        session_id: Some(child_session_id),
+                    })
+                    .await;
+            })))
+        } else {
+            None
+        };
         let mode = match params.admission_mode.as_deref().unwrap_or("queue") {
             "queue" => AdmissionMode::Queue,
             "reject_if_busy" => AdmissionMode::RejectIfBusy,
@@ -576,7 +1071,8 @@ impl DaemonState {
         }
         active.insert(
             active_key.clone(),
-            ActiveRequest::new(cancellation.clone(), run_record.run_id.clone()),
+            ActiveRequest::new(cancellation.clone(), run_record.run_id.clone())
+                .with_origin(frames.clone()),
         );
         drop(active);
         self.queue_notify.notify_waiters();
@@ -664,9 +1160,33 @@ impl DaemonState {
                 }
             }
         };
-        let run_engine = route
+        let mut run_engine = route
             .map(|route| session.engine.with_route(route))
             .unwrap_or_else(|| (*session.engine).clone());
+        if let Some(child) = &delegation {
+            run_engine = match run_engine.for_delegation(
+                &child.tools,
+                child.max_rounds as usize,
+                child.max_tokens as usize,
+            ) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    let _ = self.run_store.finish(
+                        &run_record.run_id,
+                        RunStatus::Failed,
+                        None,
+                        Some((INTERNAL_ERROR, "子 Agent 能力无法恢复")),
+                    );
+                    self.active.lock().await.remove(&active_key);
+                    send_result(
+                        &frames,
+                        request.id,
+                        Err((INTERNAL_ERROR, error.to_string())),
+                    );
+                    return;
+                }
+            };
+        }
         let (agent_events, mut event_receiver) = mpsc::unbounded_channel();
         let (approval_events, mut approval_receiver) = mpsc::unbounded_channel();
         let trace_request_id = request_id_label(&request.id);
@@ -801,6 +1321,12 @@ impl DaemonState {
                 return;
             }
         };
+        if delegation.is_some()
+            && let Ok(Some(child)) = self.run_store.delegation(&run_record.run_id)
+        {
+            self.notify_delegation_parent(&child, EventKind::DelegationTerminal)
+                .await;
+        }
         let response = if committed.status == RunStatus::UnknownAfterRestart {
             Err((-32002, "工具执行结果未知，禁止自动重放".to_owned()))
         } else {
@@ -872,9 +1398,24 @@ impl DaemonState {
             .load()
             .await
             .map_err(|error| (INTERNAL_ERROR, format!("{error:#}")))?;
+        let mut engine = self.default_session.engine.for_session(store.clone());
+        if let Some(child) = self
+            .run_store
+            .delegation_for_session(&session_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+        {
+            engine = engine
+                .for_delegation(
+                    &child.tools,
+                    child.max_rounds as usize,
+                    child.max_tokens as usize,
+                )
+                .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+            engine = engine.with_tool(self.frozen_child_read_tool(&child)?);
+        }
         let runtime = Arc::new(SessionRuntime {
             id: session_id.clone(),
-            engine: Arc::new(self.default_session.engine.for_session(store.clone())),
+            engine: Arc::new(engine),
             history: Mutex::new(history),
             store,
         });
@@ -1368,6 +1909,100 @@ impl DaemonState {
                                 .or(run.error_message.as_deref())
                                 .unwrap_or("")
                         ),
+                    }
+                }
+                SlashAction::Subagents => {
+                    if invocation.args.len() != 1 {
+                        return Err((INVALID_PARAMS, "用法：/subagents <root_run_id>".into()));
+                    }
+                    let children = self
+                        .run_store
+                        .list_delegations(&RunId(invocation.args[0].clone()))
+                        .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+                    let content = if children.is_empty() {
+                        "暂无子 Agent".to_owned()
+                    } else {
+                        children
+                            .iter()
+                            .map(|child| {
+                                format!(
+                                    "{} · {} · {}",
+                                    child.child_run_id.0,
+                                    child.child_session_id.0,
+                                    serde_json::to_value(child.status)
+                                        .unwrap_or_default()
+                                        .as_str()
+                                        .unwrap_or("unknown")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    SlashResponse::Text { content }
+                }
+                SlashAction::Subagent | SlashAction::SubagentWait | SlashAction::SubagentCancel => {
+                    if invocation.args.len() < 2
+                        || invocation.args.len() > 3
+                        || invocation.args.len() == 3
+                            && invocation.action != SlashAction::SubagentWait
+                    {
+                        return Err((INVALID_PARAMS, "用法：/subagent[-wait|-cancel] <parent_run_id> <child_run_id> [timeout_ms]".into()));
+                    }
+                    let scope = SubagentScopeParams {
+                        parent_run_id: RunId(invocation.args[0].clone()),
+                        child_run_id: RunId(invocation.args[1].clone()),
+                    };
+                    let child = self.scoped_delegation(&scope)?;
+                    match invocation.action {
+                        SlashAction::Subagent => SlashResponse::Text {
+                            content: format!(
+                                "child_run_id={} · session_id={} · status={} · result_state={} · terminal={}",
+                                child.child_run_id.0,
+                                child.child_session_id.0,
+                                serde_json::to_value(child.status)
+                                    .unwrap_or_default()
+                                    .as_str()
+                                    .unwrap_or("unknown"),
+                                child.result_state,
+                                child
+                                    .content
+                                    .as_deref()
+                                    .or(child.error_message.as_deref())
+                                    .unwrap_or("")
+                            ),
+                        },
+                        SlashAction::SubagentWait => {
+                            let timeout_ms = invocation
+                                .args
+                                .get(2)
+                                .map(|value| value.parse::<u64>())
+                                .transpose()
+                                .map_err(|_| (INVALID_PARAMS, "timeout_ms 需要非负整数".into()))?;
+                            let result = self
+                                .wait_subagents(WaitSubagentsParams {
+                                    parent_run_id: scope.parent_run_id,
+                                    child_run_ids: vec![scope.child_run_id],
+                                    timeout_ms,
+                                    after_seq: None,
+                                })
+                                .await?;
+                            SlashResponse::Text {
+                                content: result.to_string(),
+                            }
+                        }
+                        SlashAction::SubagentCancel => {
+                            let result = self
+                                .cancel(CancelParams {
+                                    request_id: None,
+                                    run_id: Some(child.child_run_id),
+                                    session_id: Some(child.child_session_id.0),
+                                })
+                                .await?;
+                            SlashResponse::Text {
+                                content: result.to_string(),
+                            }
+                        }
+                        _ => unreachable!(),
                     }
                 }
                 SlashAction::Sessions => SlashResponse::Sessions {
@@ -2154,6 +2789,48 @@ impl DaemonState {
     }
 
     async fn cancel(&self, params: CancelParams) -> Result<Value, (i64, String)> {
+        let result = self.cancel_one(params).await?;
+        let Some(run_id) = result["run_id"].as_str() else {
+            return Ok(result);
+        };
+        let run_id = RunId(run_id.to_owned());
+        let root = self
+            .run_store
+            .delegation(&run_id)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?
+            .map(|record| record.root_run_id)
+            .unwrap_or_else(|| run_id.clone());
+        let descendants = self
+            .run_store
+            .list_delegations(&root)
+            .map_err(|error| (INTERNAL_ERROR, error.to_string()))?;
+        let mut owned = HashSet::from([run_id]);
+        let mut targets = Vec::new();
+        loop {
+            let before = owned.len();
+            for child in &descendants {
+                if owned.contains(&child.parent_run_id) && owned.insert(child.child_run_id.clone())
+                {
+                    targets.push((child.child_run_id.clone(), child.child_session_id.0.clone()));
+                }
+            }
+            if owned.len() == before {
+                break;
+            }
+        }
+        for (child_run_id, child_session_id) in targets {
+            let _ = self
+                .cancel_one(CancelParams {
+                    request_id: None,
+                    run_id: Some(child_run_id),
+                    session_id: Some(child_session_id),
+                })
+                .await;
+        }
+        Ok(result)
+    }
+
+    async fn cancel_one(&self, params: CancelParams) -> Result<Value, (i64, String)> {
         let _guard = self.control_lock.lock().await;
         let mut run = if let Some(run_id) = params.run_id {
             let session_id = params

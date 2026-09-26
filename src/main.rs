@@ -14,7 +14,6 @@ mod session;
 mod skills;
 mod slash;
 mod storage;
-mod sub_agent;
 mod tool_calls;
 mod tools;
 

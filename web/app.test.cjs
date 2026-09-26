@@ -12,7 +12,7 @@ const harness = `${source.slice(0, entry)}
     renderTranscript, updateLatestButton, resizePrompt, inspectSession, refreshSessions,
     cancelTurn, useModelProfile, saveModelProfile, browseDirectory, selectBrowsedWorkspace,
     loadLatestAgentSnapshot, loadModels, resetWorkspaceState, formatDuration,
-    renderAgentTranscript, newAgentSession };
+    renderAgentTranscript, newAgentSession, refreshSubagents };
 })();`;
 
 function createHarness() {
@@ -519,4 +519,22 @@ test("快速新建任务只创建一个 Session", async () => {
   assert.equal(creations, 1);
   resolveNew({ session_id: "new", messages: [] });
   await first;
+});
+
+test("子 Agent 列表读取共享 RPC 并转义结果内容", async () => {
+  const app = createHarness();
+  app.state.connected = true;
+  app.element("#subagent-root").value = "run-root";
+  app.state.rpc = { request(method, params) {
+    assert.equal(method, "list_subagents");
+    assert.equal(params.root_run_id, "run-root");
+    return { promise: Promise.resolve({ children: [{
+      child_run_id: "run-child", status: "completed", content: "<script>alert(1)</script>",
+    }] }) };
+  } };
+  await app.refreshSubagents();
+  const html = app.element("#subagent-list").innerHTML;
+  assert.match(html, /run-child/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
 });

@@ -80,10 +80,8 @@ pub async fn run_repl(client: &DaemonClient, session_id: &mut String) -> Result<
                 Ok(false) => {}
                 Err(error) => eprintln!("命令失败：{error:#}"),
             }
-        } else {
-            if let Err(error) = run_chat(client, input, session_id).await {
-                eprintln!("任务失败：{error:#}");
-            }
+        } else if let Err(error) = run_chat(client, input, session_id).await {
+            eprintln!("任务失败：{error:#}");
         }
     }
     Ok(())
@@ -145,6 +143,13 @@ pub async fn run_chat(client: &DaemonClient, input: &str, session_id: &str) -> R
                     respond_to_approval(client, &event.data).await?;
                 }
                 EventKind::ThinkingDelta | EventKind::ThinkingFinished => {}
+                EventKind::DelegationSpawned | EventKind::DelegationTerminal => {
+                    eprintln!(
+                        "[子 Agent] {} · {}",
+                        event.data["child_run_id"].as_str().unwrap_or("?"),
+                        event.data["status"].as_str().unwrap_or("?")
+                    );
+                }
                 EventKind::TurnStarted | EventKind::TurnCompleted => {}
             },
             ServerFrame::Response(response) => {
@@ -378,6 +383,13 @@ async fn consume_recovered_stream(
                     }
                 }
                 EventKind::ThinkingDelta | EventKind::ThinkingFinished => {}
+                EventKind::DelegationSpawned | EventKind::DelegationTerminal => {
+                    eprintln!(
+                        "[子 Agent] {} · {}",
+                        event.data["child_run_id"].as_str().unwrap_or("?"),
+                        event.data["status"].as_str().unwrap_or("?")
+                    );
+                }
                 EventKind::TurnStarted | EventKind::TurnCompleted => {}
             },
             ServerFrame::Response(response) => {

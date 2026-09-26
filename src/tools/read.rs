@@ -22,7 +22,6 @@ pub struct ReadFileTool {
 }
 
 impl ReadFileTool {
-    #[cfg(test)]
     pub fn new(safety: Arc<SafetyPolicy>) -> Self {
         Self {
             safety,

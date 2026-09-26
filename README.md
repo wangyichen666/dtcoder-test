@@ -61,8 +61,8 @@ TUI 默认继承当前终端主题，也可启用内置 `dark` / `light` 语义�
 | 能力 | 当前实现 |
 |---|---|
 | **多 Provider** | OpenAI Chat Completions、Anthropic Messages、Ollama；协议差异封装在适配器内，统一输出严格 tool-call 生命周期事件；达到 token 上限的工具批次整批拒绝并安全重试。 |
-| **8 个内置工具** | `read_file`、`write_file`、`edit_file`、`exec`、`remember`、`recall_memory`、`plan`、`sub_agent`。 |
-| **计划与子 Agent** | 可重写、可持久化任务计划；`sub_agent` 支持单任务及最多 4 个独立只读任务并发，每个子任务使用全新历史、受限工具和最多 15 轮预算，不能递归派生；取消主请求时同步取消子任务。 |
+| **12 个内置工具** | 文件与命令工具、记忆、`plan`，以及 `spawn_subagent`、`wait_subagents`、`list_subagents`、`cancel_subagent` 和兼容名 `sub_agent`。 |
+| **计划与子 Agent** | 计划持久化；子 Agent 由 daemon 异步准入为独立 session/run，委派关系、终态与结果领取写入 SQLite。当前子 Agent 只继承 `read_file`；深度最多 2、每个 root 最多 8 次委派且最多 4 个活动 child。`sub_agent` 兼容名在同一持久链路上等待结果。 |
 | **图片与 PDF** | PNG/JPEG/WebP 可作为视觉内容块；PDF 在本地抽取最多 50 页文字；不支持时给出明确降级。 |
 | **三条记忆链路** | 独立 session JSONL、60%/85% 两级上下文摘要、带 TTL 的关键词/中文 bigram 长期记忆。 |
 | **Skill** | `.my-agent/skills/*.md` 使用 YAML frontmatter 与 semver，按当前请求稳定排序并按需加载正文。 |
@@ -118,7 +118,7 @@ flowchart TB
 
 ### 1. 构建
 
-需要 Rust `1.88+`。当前进程间通信使用 Unix Domain Socket，支持 macOS 和 Linux。
+需要 Rust `1.88+`。仓库通过 `rust-toolchain.toml` 固定本地工具链为 1.88.0，并在 CI 中分别检查 1.88、Linux stable 和 macOS stable。当前进程间通信使用 Unix Domain Socket，支持 macOS 和 Linux。
 
 ```bash
 git clone https://github.com/wangyichen666/agent-daemon.git
@@ -273,8 +273,12 @@ Cron：
 | `run.read` / `run.events` / `run.tools` / `run.audit` | `run_id`；events 可带 `after_seq/limit` | 状态、分页事件、工具回执、一致性诊断 |
 | `run.provider_attempts` | `run_id` | 冻结 route、每次 Provider attempt、run 级 usage；不返回 API key 或原始上游响应 |
 | `run.reconcile` | `session_id`, `run_id`, `expected_last_seq`, `status`, `evidence`；completed 需 `content` | 只修复 unknown run；校验 owner 与事件序号，记录证据摘要和人工决议 |
+| `spawn_subagent` | `parent_session_id`, `parent_run_id`, `spawn_key`, `task`；可选 `tools/max_rounds/max_tokens/max_tool_calls/timeout_ms` | 原子准入后立即返回 `child`，包含稳定 session/run ID、能力快照和状态；相同 spawn key 幂等 |
+| `list_subagents` / `read_subagent` | `root_run_id` / `parent_run_id + child_run_id` | 读取持久委派树或指定 child 的状态与终态 |
+| `wait_subagents` / `cancel_subagent` | `parent_run_id + child_run_ids + timeout_ms? + after_seq?` / `parent_run_id + child_run_id` | 有限时间等待终态或事件游标进展；超时不修改 child；取消只作用于持久证明的委派子树 |
+| `subagent.result.reserve/release/commit` | `parent_run_id`, `child_run_id`, `owner`, `revision` | 结果消费与 child 终态分离；30 秒租约、幂等领取与冲突检测 |
 
-新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`run.reconcile` 仅供本地操作者在检查 `run.audit` 后使用，不会自动重放工具或修改旧 JSONL。`steer`、强沙箱、可恢复子 Agent 仍属于后续阶段。
+新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`run.reconcile` 仅供本地操作者在检查 `run.audit` 后使用，不会自动重放工具或修改旧 JSONL。运行中的 child 在重启后标为 `unknown_after_restart`，已完成的结果可读回；`steer` 和强沙箱仍属于后续阶段。CLI/ACP/TUI 可使用 `/subagents <root_run_id>`、`/subagent <parent_run_id> <child_run_id>`、`/subagent-wait`、`/subagent-cancel`；Web 的子 Agent 卡片使用相同 RPC。
 
 ## 安全边界
 
@@ -342,7 +346,8 @@ src/context.rs             上下文排序、Skill、估算与两级压缩
 src/session.rs             稳定 session、append-only JSONL 与结构化 trace
 src/memory.rs              TTL 长期记忆与关键词/bigram 召回
 src/plan.rs                原子持久化计划
-src/sub_agent.rs           隔离上下文的受限子 Agent
+src/daemon/delegation_tool.rs  模型工具到持久委派控制面的映射
+src/storage/delegation.rs     SQLite 委派树与结果领取状态
 src/skills.rs              版本化 Skill 索引与按需加载
 src/cron.rs                Cron、重试与 heartbeat
 src/mcp.rs                 MCP stdio 客户端与工具桥接
@@ -362,9 +367,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 node --test web/app.test.cjs
 node --check web/app.js
+git diff --check
+cargo deny check
 ```
 
-测试使用本地 mock Provider，不需要真实 API Key。真实模型端到端测试需要自行提供对应服务配置。
+`cargo deny check` 检查漏洞公告、许可证和依赖来源，首次执行需要获取 RustSec 公告库。测试使用本地 mock Provider，不需要真实 API Key。真实模型端到端测试需要自行提供对应服务配置。
 
 ## 当前边界
 

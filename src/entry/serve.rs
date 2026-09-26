@@ -776,10 +776,7 @@ async fn chat_completions(
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            format!(
-                "当前 daemon 模型为 {}，不支持请求模型 {requested}",
-                active_model
-            ),
+            format!("当前 daemon 模型为 {active_model}，不支持请求模型 {requested}"),
         );
     }
     let Some(prompt) = extract_latest_user_prompt(&request.messages) else {

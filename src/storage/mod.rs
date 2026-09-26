@@ -1,4 +1,7 @@
 //! SQLite control facts. JSONL remains a readable transcript, not the run authority.
+mod delegation;
+
+pub use delegation::{DelegationRecord, DelegationRequest};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -88,7 +91,7 @@ impl RunStatus {
             _ => Err(RuntimeError::Protocol(format!("未知 run 状态: {value}"))),
         }
     }
-    fn terminal(self) -> bool {
+    pub(crate) fn terminal(self) -> bool {
         matches!(
             self,
             Self::Completed | Self::Failed | Self::Cancelled | Self::UnknownAfterRestart
@@ -191,7 +194,7 @@ impl RunStore {
             [],
             |row| row.get(0),
         )?;
-        if version > 4 {
+        if version > 5 {
             return Err(RuntimeError::Protocol(format!(
                 "SQLite schema 版本 {version} 比当前程序支持的版本新"
             )));
@@ -267,6 +270,45 @@ impl RunStore {
                 INSERT INTO schema_migrations(version, applied_at_ms)
                     VALUES (4, CAST(strftime('%s','now') AS INTEGER) * 1000);
                 COMMIT;")?;
+        }
+        if version < 5 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE delegations(
+                    id INTEGER PRIMARY KEY,
+                    root_session_id TEXT NOT NULL REFERENCES sessions(id),
+                    root_run_id TEXT NOT NULL REFERENCES runs(id),
+                    parent_session_id TEXT NOT NULL REFERENCES sessions(id),
+                    parent_run_id TEXT NOT NULL REFERENCES runs(id),
+                    spawn_key TEXT NOT NULL,
+                    child_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+                    child_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+                    depth INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    started_at_ms INTEGER,
+                    finished_at_ms INTEGER,
+                    tools_json TEXT NOT NULL,
+                    permission_mode TEXT NOT NULL,
+                    route_json TEXT,
+                    cwd TEXT NOT NULL,
+                    max_rounds INTEGER NOT NULL,
+                    max_tokens INTEGER NOT NULL,
+                    max_tool_calls INTEGER NOT NULL,
+                    deadline_ms INTEGER NOT NULL,
+                    terminal_json TEXT,
+                    result_state TEXT NOT NULL DEFAULT 'unconsumed',
+                    reservation_owner TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    reservation_released_at_ms INTEGER,
+                    reservation_expires_at_ms INTEGER,
+                    UNIQUE(parent_run_id, spawn_key));
+                CREATE INDEX delegations_root ON delegations(root_run_id, id);
+                CREATE INDEX delegations_parent ON delegations(parent_run_id, id);
+                INSERT INTO schema_migrations(version, applied_at_ms)
+                    VALUES (5, CAST(strftime('%s','now') AS INTEGER) * 1000);
+                COMMIT;",
+            )?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -421,6 +463,11 @@ impl RunStore {
                 "UPDATE queued_messages SET status='running' WHERE run_id=?1",
                 params![run_id.0],
             )?;
+            transaction.execute(
+                "UPDATE delegations SET status='running', started_at_ms=?2
+                WHERE child_run_id=?1",
+                params![run_id.0, now_ms()],
+            )?;
         }
         transaction.commit()?;
         Ok(changed == 1)
@@ -517,6 +564,8 @@ impl RunStore {
                 "terminal",
                 &serde_json::json!({"status": RunStatus::Cancelled}),
             )?;
+            let cancelled = read_run_in(&transaction, &run_id.0)?.expect("cancelled run");
+            delegation::mark_terminal_in(&transaction, run_id, &cancelled)?;
         }
         transaction.commit()?;
         Ok(changed == 1)
@@ -537,6 +586,23 @@ impl RunStore {
         )?;
         if status != "running" {
             return Err(RuntimeError::Protocol("run 不在执行状态".into()));
+        }
+        let budget: Option<i64> = transaction
+            .query_row(
+                "SELECT max_tool_calls FROM delegations WHERE child_run_id=?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(budget) = budget {
+            let used: i64 = transaction.query_row(
+                "SELECT count(*) FROM tool_executions WHERE run_id=?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )?;
+            if used + calls.len() as i64 > budget {
+                return Err(RuntimeError::Protocol("子 Agent 工具调用预算已耗尽".into()));
+            }
         }
         for (call, effect, digest, replay) in calls {
             transaction.execute("INSERT INTO tool_executions(run_id, round, call_id, name, status, effect, argument_digest, prepared_at_ms, safe_to_replay)
@@ -905,6 +971,7 @@ impl RunStore {
         )?;
         transaction.execute("UPDATE interactions SET status='orphaned', revision=revision+1 WHERE run_id=?1 AND status='pending'", params![run_id.0])?;
         let result = read_run_in(&transaction, &run_id.0)?.expect("run still exists");
+        delegation::mark_terminal_in(&transaction, run_id, &result)?;
         transaction.commit()?;
         Ok(result)
     }
@@ -941,6 +1008,18 @@ impl RunStore {
                 "run owner、状态或事件序号冲突".into(),
             ));
         }
+        let child_result_state: Option<String> = transaction
+            .query_row(
+                "SELECT result_state FROM delegations WHERE child_run_id=?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if child_result_state.is_some_and(|state| state != "unconsumed") {
+            return Err(RuntimeError::Protocol(
+                "已领取的子 Agent 结果不能人工改写".into(),
+            ));
+        }
         let digest = format!("{:x}", Sha256::digest(evidence.as_bytes()));
         if let Some(content) = content.filter(|_| status == RunStatus::Completed) {
             insert_event(
@@ -975,6 +1054,7 @@ impl RunStore {
             params![run_id.0, status.as_str()],
         )?;
         let result = read_run_in(&transaction, &run_id.0)?.expect("reconciled run");
+        delegation::mark_terminal_in(&transaction, run_id, &result)?;
         transaction.commit()?;
         Ok(result)
     }
@@ -1195,6 +1275,8 @@ impl RunStore {
                 "UPDATE queued_messages SET status='unknown_after_restart' WHERE run_id=?1",
                 params![id],
             )?;
+            let unknown = read_run_in(&transaction, id)?.expect("recovered run");
+            delegation::mark_terminal_in(&transaction, &run_id, &unknown)?;
         }
         // The question stays readable, but no vanished task may answer or execute it.
         transaction.execute(
@@ -1807,12 +1889,262 @@ mod tests {
             upgraded.tool_receipts(&RunId("old-run".into())).unwrap()[0].call_id,
             "old-call"
         );
+        assert!(
+            upgraded
+                .list_delegations(&RunId("old-run".into()))
+                .unwrap()
+                .is_empty()
+        );
         drop(upgraded);
         let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 5);
         connection
             .execute("INSERT INTO schema_migrations VALUES (99, 99)", [])
             .unwrap();
         drop(connection);
         assert!(RunStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn delegation_is_atomic_bounded_and_result_reservation_is_recoverable() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(parent) = store
+            .admit(
+                SessionId("session-parent.jsonl".into()),
+                RequestId::Number(1),
+                "父任务",
+            )
+            .unwrap()
+        else {
+            panic!("new parent")
+        };
+        assert!(store.try_start_queued(&parent.run_id).unwrap());
+        let child = store
+            .admit_delegation(DelegationRequest {
+                parent_session_id: parent.session_id.clone(),
+                parent_run_id: parent.run_id.clone(),
+                child_session_id: SessionId("session-child.jsonl".into()),
+                spawn_key: "call-1".into(),
+                task: "调查".into(),
+                tools: vec!["read_file".into()],
+                permission_mode: "request_approval".into(),
+                cwd: "/workspace".into(),
+                max_rounds: 15,
+                max_tokens: 8192,
+                max_tool_calls: 32,
+                deadline_ms: now_ms() + 60_000,
+            })
+            .unwrap();
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.root_run_id, parent.run_id);
+        assert_eq!(child.status, RunStatus::Queued);
+        assert_eq!(store.list_delegations(&parent.run_id).unwrap().len(), 1);
+        assert_eq!(
+            store.read_run(&child.child_run_id).unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+        assert!(store.try_start_queued(&child.child_run_id).unwrap());
+        store
+            .finish(
+                &child.child_run_id,
+                RunStatus::Completed,
+                Some("结论"),
+                None,
+            )
+            .unwrap();
+        let reserved = store
+            .reserve_delegation_result(&child.child_run_id, "owner-a", 0)
+            .unwrap();
+        assert_eq!(reserved.result_state, "reserved");
+        assert_eq!(reserved.revision, 1);
+        assert!(
+            store
+                .reserve_delegation_result(&child.child_run_id, "owner-b", 1)
+                .is_err()
+        );
+        store
+            .release_delegation_result(&child.child_run_id, "owner-a", 1)
+            .unwrap();
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        let recovered = reopened.delegation(&child.child_run_id).unwrap().unwrap();
+        assert_eq!(recovered.status, RunStatus::Completed);
+        assert_eq!(recovered.result_state, "unconsumed");
+        assert_eq!(recovered.content.as_deref(), Some("结论"));
+        let reserved = reopened
+            .reserve_delegation_result(&child.child_run_id, "owner-b", 2)
+            .unwrap();
+        let delivered = reopened
+            .deliver_delegation_result(&child.child_run_id, "owner-b", reserved.revision)
+            .unwrap();
+        assert_eq!(delivered.result_state, "delivered");
+        assert!(
+            reopened
+                .release_delegation_result(&child.child_run_id, "owner-a", delivered.revision)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_delegation_admission_respects_root_budget_and_tool_cap() {
+        let store = std::sync::Arc::new(RunStore::open(&path()).unwrap());
+        let Admission::New(parent) = store
+            .admit(
+                SessionId("budget-parent".into()),
+                RequestId::Number(1),
+                "父任务",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&parent.run_id).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let handles = (0..12)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                let parent = parent.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.admit_delegation(DelegationRequest {
+                        parent_session_id: parent.session_id,
+                        parent_run_id: parent.run_id,
+                        child_session_id: SessionId(format!("child-{index}")),
+                        spawn_key: format!("call-{index}"),
+                        task: "调查".into(),
+                        tools: vec!["read_file".into()],
+                        permission_mode: "request_approval".into(),
+                        cwd: "/workspace".into(),
+                        max_rounds: 2,
+                        max_tokens: 1024,
+                        max_tool_calls: 1,
+                        deadline_ms: now_ms() + 60_000,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(store.list_delegations(&parent.run_id).unwrap().len(), 4);
+        let child = &admitted[0];
+        assert!(store.try_start_queued(&child.child_run_id).unwrap());
+        let call = ToolCall {
+            id: "read-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path":"a"}),
+        };
+        store
+            .prepare_tool_batch(
+                &child.child_run_id,
+                1,
+                &[(call.clone(), "read".into(), "digest".into(), true)],
+            )
+            .unwrap();
+        assert!(
+            store
+                .prepare_tool_batch(
+                    &child.child_run_id,
+                    2,
+                    &[(
+                        ToolCall {
+                            id: "read-2".into(),
+                            ..call
+                        },
+                        "read".into(),
+                        "digest".into(),
+                        true
+                    )]
+                )
+                .is_err()
+        );
+        let grandchild = store.admit_delegation(DelegationRequest {
+            parent_session_id: child.child_session_id.clone(),
+            parent_run_id: child.child_run_id.clone(),
+            child_session_id: SessionId("grandchild".into()),
+            spawn_key: "nested".into(),
+            task: "继续调查".into(),
+            tools: vec!["read_file".into()],
+            permission_mode: "request_approval".into(),
+            cwd: "/workspace".into(),
+            max_rounds: 1,
+            max_tokens: 512,
+            max_tool_calls: 1,
+            deadline_ms: now_ms() + 60_000,
+        });
+        assert!(grandchild.is_err(), "root 并发上限也限制嵌套委派");
+    }
+
+    #[test]
+    fn delegation_depth_and_total_spawn_limits_are_transactional() {
+        let store = RunStore::open(&path()).unwrap();
+        let Admission::New(root) = store
+            .admit(
+                SessionId("depth-root".into()),
+                RequestId::Number(1),
+                "父任务",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&root.run_id).unwrap());
+        let make_request = |parent: &RunRecord, index: usize| DelegationRequest {
+            parent_session_id: parent.session_id.clone(),
+            parent_run_id: parent.run_id.clone(),
+            child_session_id: SessionId(format!("depth-child-{index}")),
+            spawn_key: format!("call-{index}"),
+            task: "调查".into(),
+            tools: vec!["read_file".into()],
+            permission_mode: "request_approval".into(),
+            cwd: "/workspace".into(),
+            max_rounds: 2,
+            max_tokens: 1024,
+            max_tool_calls: 2,
+            deadline_ms: now_ms() + 60_000,
+        };
+        let child = store.admit_delegation(make_request(&root, 0)).unwrap();
+        assert!(store.try_start_queued(&child.child_run_id).unwrap());
+        let child_run = store.read_run(&child.child_run_id).unwrap().unwrap();
+        let grandchild = store.admit_delegation(make_request(&child_run, 1)).unwrap();
+        assert_eq!(grandchild.depth, 2);
+        assert!(store.try_start_queued(&grandchild.child_run_id).unwrap());
+        let grandchild_run = store.read_run(&grandchild.child_run_id).unwrap().unwrap();
+        assert!(
+            store
+                .admit_delegation(make_request(&grandchild_run, 2))
+                .is_err()
+        );
+        store
+            .finish(
+                &grandchild.child_run_id,
+                RunStatus::Completed,
+                Some("完成"),
+                None,
+            )
+            .unwrap();
+        store
+            .finish(
+                &child.child_run_id,
+                RunStatus::Completed,
+                Some("完成"),
+                None,
+            )
+            .unwrap();
+        for index in 2..8 {
+            let child = store.admit_delegation(make_request(&root, index)).unwrap();
+            store.remove_queued(&child.child_run_id).unwrap();
+        }
+        assert_eq!(store.list_delegations(&root.run_id).unwrap().len(), 8);
+        assert!(store.admit_delegation(make_request(&root, 8)).is_err());
     }
 }

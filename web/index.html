@@ -105,6 +105,12 @@
                 <strong id="agent-session-id">尚未选择</strong>
                 <button id="inspect-current" type="button" disabled>查看完整 Session 与链路</button>
               </div>
+              <div class="task-card" aria-label="子 Agent 控制面">
+                <span>子 Agent</span>
+                <input id="subagent-root" type="text" aria-label="root run ID" placeholder="root run ID" />
+                <button id="refresh-subagents" type="button">刷新子 Agent</button>
+                <div id="subagent-list" aria-live="polite">输入 root run ID 后刷新。</div>
+              </div>
               <div class="activity-heading">
                 <strong>本轮执行</strong>
                 <span>实时</span>

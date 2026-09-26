@@ -59,3 +59,16 @@
 - OpenAI 兼容服务需要接受 `stream_options.include_usage` 才能返回结构化用量；拒绝该字段的服务会按 `InvalidRequest` 失败，需针对该服务调整配置或适配器。真实商业 API 端到端兼容性尚未用密钥测试。
 - `ContextOverflow` 只对本轮输入副本进行一次现有摘要式压缩；摘要生成失败或压缩未缩小时保留原输入并返回类型化溢出错误。持久 compact projection 留待 P7。
 - queued run 在 daemon 重启后仍按已持久 route 恢复；若配置 ID、模型或 URL 摘要已改变，按 fail closed 结束，避免静默切换。API key 轮换可用相同配置 ID 和路由元数据恢复。
+
+## P0 CI 远端验证边界（2026-09-26）
+
+RustSec 公告库已可访问，完整 `cargo deny check` 在依赖升级后通过。新 CI 工作流尚未在 GitHub Actions 实际运行，Linux/macOS 托管 runner 的结果仍待首次提交验证。
+P5 本轮重新执行在线检查时 GitHub 443 连接超时；离线使用本地缓存公告库的四项检查通过。远端公告库的最新变化仍待网络恢复后核对。
+
+## P5 子 Agent 剩余边界（2026-09-26）
+
+- 子 Agent 当前只继承 `read_file`。`exec`、写入、MCP 等能力会在准入时拒绝；未来若扩大能力，需先冻结独立权限与 cwd 执行上下文并验证副作用恢复。
+- `wait_subagents` 的 `after_seq` 表示子 run 事件游标前进；P7 的持久上下文 checkpoint 尚未实现。等待本身不预留结果，断线或超时不会改变 child 状态。
+- 结果 reservation 为 30 秒租约。客户端收到 reserve 后需调用 commit 或 release；断线时无需服务端推断业务终态，租约过期后可重领。
+- token 上限依据已报告的 Provider usage 和本地估算在响应后检查；Provider 单次超额输出无法事前完全阻止。活动 child 的 steer、terminal revival 尚未实现。
+- 父 run 若先于 child 结束，其原有流已经关闭；child 终态仍可经 `list_subagents`、`read_subagent` 与 child session 订阅读取。真实商业 Provider 的异步委派兼容性尚未用密钥验证。
