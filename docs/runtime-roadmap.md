@@ -1,17 +1,18 @@
 # 本地 Agent Runtime 路线图
 
-更新日期：2026-09-24。本文件只记录已实现的行为与待办，不把下一阶段设计当作现有保证。
+更新日期：2026-09-26。本文件只记录已实现的行为与待办，不把下一阶段设计当作现有保证。
 
 ## 阶段与状态
 
 | 阶段 | 状态 | 本轮范围 | 后续 |
 |---|---|---|---|
 | P0 基线与护栏 | 已完成 | 类型化 ID、Runtime 错误分类、模块依赖说明、CLI/ACP/Web 同一 run 黑盒契约测试 | 后续按需扩大故障矩阵 |
-| P1 持久 Run | 本轮纵切完成 | 工具批次 prepared/running/terminal 回执、`run.tools`、`run.audit`、崩溃窗口与旧库迁移测试 | JSONL 检查只是诊断，未提供自动 repair；未知副作用不重放 |
-| P2 控制面 | 本轮纵切完成 | daemon 持久队列与单写者、exact run 取消、approval interaction 读写、结构化 resync、TUI 队列投影 | 不恢复已消失的 LLM future；question/plan 仅预留 payload；不实现 steer |
-| P3–P8 | 未开始 | 保持现有安全、Provider、子 Agent 和工具行为 | 按需求文档顺序实施 |
+| P1 持久 Run | 已完成本阶段 | 工具回执、`run.audit`、显式 `run.reconcile`、崩溃窗口与旧库迁移测试 | JSONL 只是诊断；未知副作用不重放 |
+| P2 控制面 | 已完成本阶段 | 持久队列、exact 取消、approval interaction、resync、受管请求任务与关闭收敛 | 不恢复已消失的 LLM future；question/plan 仅预留 payload；不实现 steer |
+| P3 | Native 纵切完成 | 文件能力、原子写入、流式有界 exec、资源登记与关闭清理 | Docker backend、后台进程另行实施 |
+| P4–P8 | 未开始 | 保持现有 Provider、子 Agent 和工具行为 | 按需求文档顺序实施 |
 
-本轮在原 `RunStore` 上添加 v2/v3 前进迁移。v2 让工具回执按 `(run_id, round, call_id)` 唯一，新增 effect、参数 SHA-256 摘要、起止时间、typed outcome、artifact 引用和 replay 标志；队列加唯一索引、session 状态索引，interaction 加 revision。完整工具输出经原子写入 `.my-agent/tool-artifacts/`，SQLite 回执只保留有界预览和摘要。v3 为 interaction 增加类型化 payload。旧 v1 数据原地保留并回填 queued run；未来版本继续 fail closed。
+本轮在原 `RunStore` 上添加 v2/v3 前进迁移。v2 让工具回执按 `(run_id, round, call_id)` 唯一，新增 effect、参数 SHA-256 摘要、起止时间、typed outcome、artifact 引用和 replay 标志；队列加唯一索引、session 状态索引，interaction 加 revision。完整工具输出经原子写入 `.my-agent/runtime.artifacts/`，SQLite 回执只保留有界预览和摘要。v3 为 interaction 增加类型化 payload。旧 v1 数据原地保留并回填 queued run；未来版本继续 fail closed。
 
 ## 事实所有权
 
@@ -48,9 +49,13 @@
 
 ## 下一步顺序
 
-1. 进入 P3 前需把 `run.audit` 的诊断扩为可操作的人工 repair 流程，并补更细的 JSONL/tool-result 配对故障注入；当前不会自动改写历史。
-2. 进入 P3 前还需为后台资源建立可 join/abort 的 owner 管理，并补审批响应与取消在真实工具副作用边界的并发故障测试。现有 daemon shutdown 停止准入、取消活动执行体并等待收敛；queued run 保留供重启调度。
-3. P3 以后再实现强文件身份校验、可插拔 sandbox、Provider 韧性和异步子 Agent。当前不得宣传这些保证。
+P1/P2 的人工 repair、受管任务关闭和审批取消副作用测试已完成。P3 Native 纵切已落地；下一步可增加 Docker backend 与后台进程管理，然后按 P4 处理 Provider 韧性。本轮不自动重放 unknown run，也不把 JSONL 当作终态权威。
+
+## P3 本轮范围与边界
+
+本轮建立 `Sandbox`/Native backend、显式 `ExecRequest`/`ExecResult`、文件 intent 与不可由调用者构造的 `AuthorizedPath`，并将内置 read/write/edit/exec 工具接入。Native 文件操作通过目录句柄相对打开、最终组件 no-follow、身份与内容版本复核、同目录临时文件和原子替换完成。命令输出以固定大小缓冲区流式采集，取消和超时清理进程组；登记前台资源供关闭时停止。安全策略明确保护运行时数据库、Git 元数据、系统目录与用户密钥目录，并拒绝硬链接写入。
+
+Native 不是强隔离：同一用户的恶意进程仍可能修改目录树或绕开 Agent 工具，Shell 命令本身可直接访问宿主文件。Docker backend、跨平台完整实现和进程后台化留待后续纵切；接口会明确报告 requested/effective backend。任何不满足当前能力验证的文件操作都拒绝，不降级为普通路径重开。
 
 ## 验证
 
@@ -64,4 +69,4 @@ git diff --check
 
 `tests/runtime_contract.rs` 使用本地 mock Ollama 和真实 daemon 进程，不需要 API key。测试检查终态重启读回、未知 run 不重放、排队请求断线 readback、exact queued cancel、旧幂等键、重启后 queued run 恢复；CLI `/run`、ACP `/run`、WebSocket `run.read` 核对同一 run。单元/契约测试覆盖 v1 原地迁移、未来版本拒绝、工具崩溃窗口、单写者、interaction owner/revision/幂等与订阅 resync 游标。
 
-本轮验证：165 个单元测试、2 个真实进程黑盒测试通过；`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo build --release`、`git diff --check` 均通过。P1/P2 的本轮最小纵切完成；上文列出的 repair、后台资源 owner 与更细故障注入仍是进入 P3 前的门槛。
+本轮 181 个单元测试和 2 个进程契约测试通过；`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo build --release`、`git diff --check` 均通过。覆盖显式人工修复的 owner/seq CAS、Unix 真实关闭收敛、审批取消竞争（副作用已开始时不得确认取消）、路径替换/硬链接/内容漂移、命令包装与替换、孙进程取消及输出洪水。P4 及后续尚未实施。

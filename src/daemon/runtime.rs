@@ -125,17 +125,21 @@ pub async fn build_daemon_state(workspace: &Path) -> Result<Arc<DaemonState>> {
             .ok_or_else(|| anyhow::anyhow!("queued run {} 缺少队列项", queued.run_id.0))?
             .message;
         let state = state.clone();
-        tokio::spawn(async move {
-            let (frames, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-            let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
-            let request = JsonRpcRequest::new(
-                queued.request_id,
-                "chat.send",
-                serde_json::json!({"session_id": queued.session_id.0, "message": message}),
-            );
-            state.handle_request(request, frames).await;
-            let _ = drain.await;
-        });
+        let owner = state.clone();
+        let accepted = state
+            .spawn_owned(async move {
+                let (frames, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+                let request = JsonRpcRequest::new(
+                    queued.request_id,
+                    "chat.send",
+                    serde_json::json!({"session_id": queued.session_id.0, "message": message}),
+                );
+                let process = owner.handle_request(request, frames);
+                let drain = async { while receiver.recv().await.is_some() {} };
+                tokio::join!(process, drain);
+            })
+            .await;
+        debug_assert!(accepted, "daemon 尚未进入 shutdown");
     }
     cron.start(state.shutdown.clone()).await;
     Ok(state)

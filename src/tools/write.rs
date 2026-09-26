@@ -47,19 +47,14 @@ impl Tool for WriteFileTool {
 
     async fn execute(&self, args: Value) -> Result<String> {
         let args: WriteArgs = serde_json::from_value(args).context("write_file 参数无效")?;
-        let path = self
+        let authorized = self
             .safety
-            .authorize_path(&args.path, PathIntent::Write)
+            .authorize_file(&args.path, PathIntent::Write)
             .await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("创建父目录失败: {}", parent.display()))?;
-        }
-        tokio::fs::write(&path, args.content)
-            .await
-            .with_context(|| format!("写入文件失败: {}", path.display()))?;
-        Ok(format!("已写入 {}", path.display()))
+        authorized
+            .atomic_write(args.content.as_bytes())
+            .with_context(|| format!("写入文件失败: {}", authorized.path().display()))?;
+        Ok(format!("已写入 {}", authorized.path().display()))
     }
 }
 

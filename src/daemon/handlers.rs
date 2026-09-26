@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{Instrument, info, info_span};
 
@@ -20,7 +22,7 @@ use crate::cron::ScheduleSpec;
 use crate::loop_engine::{AgentEvent, CancellationToken};
 use crate::provider::ProviderProfile;
 use crate::safety::SafetyMode;
-use crate::session::SessionStatus;
+use crate::session::{SessionStatus, SessionTraceRecord};
 use crate::slash::{SlashAction, SlashParse, SlashRegistry, SlashResponse};
 use crate::storage::{
     Admission, AdmissionMode, EventSeq, InteractionId, RunId, RunStatus, RuntimeError, SessionId,
@@ -87,6 +89,17 @@ struct SubscribeParams {
 #[derive(Deserialize)]
 struct RunReadParams {
     run_id: RunId,
+}
+
+#[derive(Deserialize)]
+struct RunReconcileParams {
+    session_id: SessionId,
+    run_id: RunId,
+    expected_last_seq: EventSeq,
+    status: RunStatus,
+    #[serde(default)]
+    content: Option<String>,
+    evidence: String,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +347,35 @@ impl DaemonState {
                 };
                 send_result(&frames, request.id, result);
             }
+            "run.reconcile" => {
+                let result = match parse_params::<RunReconcileParams>(&request.params) {
+                    Ok(params) => {
+                        let active = self
+                            .active
+                            .lock()
+                            .await
+                            .values()
+                            .any(|item| item.run_id == params.run_id);
+                        if active {
+                            Err((REQUEST_CONFLICT, "run 仍有活动执行体".into()))
+                        } else {
+                            self.run_store
+                                .reconcile_unknown(
+                                    &params.run_id,
+                                    &params.session_id,
+                                    params.expected_last_seq,
+                                    params.status,
+                                    params.content.as_deref(),
+                                    &params.evidence,
+                                )
+                                .map(|run| json!({"run": run}))
+                                .map_err(|error| (REQUEST_CONFLICT, error.to_string()))
+                        }
+                    }
+                    Err(error) => Err((INVALID_PARAMS, error)),
+                };
+                send_result(&frames, request.id, result);
+            }
             "run.events" => {
                 let result = parse_params::<RunEventsParams>(&request.params)
                     .map_err(|error| (INVALID_PARAMS, error))
@@ -363,13 +405,13 @@ impl DaemonState {
                 send_result(
                     &frames,
                     request.id,
-                    Ok(json!({"stopping": true, "active_turns_finish_gracefully": true})),
+                    Ok(
+                        json!({"stopping": true, "active_turns_finish_gracefully": false,
+                        "active_turns_cancelled": true}),
+                    ),
                 );
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    shutdown.cancel();
-                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.shutdown.cancel();
             }
             _ => {
                 let _ = frames.send(ServerFrame::Response(JsonRpcResponse::failure(
@@ -1926,16 +1968,27 @@ impl DaemonState {
             .session
             .open_known_session(&run.session_id.0)
             .map_err(|error| (INTERNAL_ERROR, format!("JSONL 读取失败: {error:#}")))?;
-        let messages = store
-            .load()
-            .await
-            .map_err(|error| (INTERNAL_ERROR, format!("JSONL 读取失败: {error:#}")))?;
+        let (messages, jsonl_error) = match store.load().await {
+            Ok(messages) => (messages, None),
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        };
         let matching_assistant = run.content.as_ref().is_some_and(|content| {
             messages.iter().any(|message| {
                 message.role == crate::provider::Role::Assistant
                     && message.content.as_ref() == Some(content)
             })
         });
+        let trace_label = request_id_label(&run.request_id);
+        let (trace_started, trace_completed, trace_error) = match store.load_trace().await {
+            Ok(records) => {
+                let started = records.iter().filter(|record| matches!(record,
+                    SessionTraceRecord::TurnStarted { request_id, .. } if request_id == &trace_label)).count();
+                let completed = records.iter().filter(|record| matches!(record,
+                    SessionTraceRecord::TurnCompleted { request_id, .. } if request_id == &trace_label)).count();
+                (started, completed, None)
+            }
+            Err(error) => (0, 0, Some(format!("{error:#}"))),
+        };
         let receipts = self
             .run_store
             .tool_receipts(run_id)
@@ -1944,7 +1997,31 @@ impl DaemonState {
             .iter()
             .filter(|receipt| receipt.status != "terminal")
             .count();
-        let diagnostic = if run.status == RunStatus::Completed && !matching_assistant {
+        let mut missing_artifacts = Vec::new();
+        let mut corrupt_artifacts = Vec::new();
+        for receipt in &receipts {
+            let Some(path) = receipt.artifact_ref.as_deref() else {
+                continue;
+            };
+            let expected = receipt
+                .receipt
+                .as_ref()
+                .and_then(|value| value["output_sha256"].as_str());
+            match artifact_sha256(path).await {
+                Ok(actual) if expected.is_some_and(|expected| expected != actual) => {
+                    corrupt_artifacts
+                        .push(json!({"round": receipt.round, "call_id": receipt.call_id}))
+                }
+                Ok(_) => {}
+                Err(_) => missing_artifacts
+                    .push(json!({"round": receipt.round, "call_id": receipt.call_id})),
+            }
+        }
+        let diagnostic = if !missing_artifacts.is_empty() || !corrupt_artifacts.is_empty() {
+            "artifact_missing_or_corrupt"
+        } else if run.status == RunStatus::Completed
+            && (!matching_assistant || jsonl_error.is_some())
+        {
             "jsonl_missing_or_diverged"
         } else if run.status == RunStatus::UnknownAfterRestart {
             "control_state_unknown"
@@ -1952,9 +2029,17 @@ impl DaemonState {
             "no_detected_divergence"
         };
         Ok(
-            json!({"run_id": run_id, "control_status": run.status, "last_seq": run.last_seq,
-            "diagnostic": diagnostic, "jsonl_matching_assistant": matching_assistant,
-            "incomplete_tool_receipts": incomplete, "jsonl_is_authoritative": false}),
+            json!({"run_id": run_id, "session_id": run.session_id, "control_status": run.status,
+            "last_seq": run.last_seq, "diagnostic": diagnostic,
+            "jsonl_matching_assistant": matching_assistant,
+            "incomplete_tool_receipts": incomplete,
+            "jsonl_is_authoritative": false,
+            "jsonl": {"message_count": messages.len(), "matching_assistant_anywhere": matching_assistant,
+                "error": jsonl_error, "authoritative": false},
+            "trace": {"turn_started": trace_started, "turn_completed": trace_completed, "error": trace_error},
+            "tools": {"receipt_count": receipts.len(), "incomplete": incomplete,
+                "missing_artifacts": missing_artifacts, "corrupt_artifacts": corrupt_artifacts},
+            "manual_resolution": if run.status == RunStatus::UnknownAfterRestart { "run.reconcile 需要人工证据和 expected_last_seq" } else { "不适用" }}),
         )
     }
 
@@ -2293,6 +2378,20 @@ fn strip_ansi_sequences(input: &str) -> String {
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|error| format!("参数无效: {error}"))
+}
+
+async fn artifact_sha256(path: &str) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn request_id_label(request_id: &RequestId) -> String {

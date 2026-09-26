@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::DaemonState;
 use super::lifecycle::RuntimePaths;
@@ -25,6 +26,14 @@ pub(crate) struct InMemoryEnvelope {
 
 #[cfg(test)]
 pub struct InMemoryServer;
+
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[cfg(test)]
 impl InMemoryServer {
@@ -58,7 +67,7 @@ pub async fn run_unix_server(
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("监听 Unix socket 失败: {}", paths.socket.display()))?;
     paths.mark_ready(workspace).await?;
-    let (connection_done, mut done_receiver) = mpsc::unbounded_channel::<()>();
+    let mut connections = JoinSet::new();
     let mut clients = 0usize;
     let mut accepted_any = false;
     let mut idle_since = None;
@@ -74,15 +83,14 @@ pub async fn run_unix_server(
                 accepted_any = true;
                 idle_since = None;
                 let state = state.clone();
-                let connection_done = connection_done.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(error) = serve_unix_connection(stream, state).await {
                         tracing::warn!(%error, "daemon 客户端连接异常结束");
                     }
-                    let _ = connection_done.send(());
                 });
             }
-            Some(()) = done_receiver.recv() => {
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result { tracing::warn!(%error, "daemon 连接任务异常结束"); }
                 clients = clients.saturating_sub(1);
                 if clients == 0 {
                     idle_since = Some(tokio::time::Instant::now());
@@ -107,6 +115,8 @@ pub async fn run_unix_server(
     }
 
     state.shutdown.cancel();
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     let active = state
         .active
         .lock()
@@ -121,8 +131,15 @@ pub async fn run_unix_server(
             .cancel_request_in_session(&key.session_id, &key.request_id)
             .await;
     }
-    while state.has_active_turns().await {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    state.default_session.engine.stop_resources();
+    let aborted = state.join_owned(Duration::from_secs(5)).await;
+    if aborted > 0 {
+        tracing::warn!(aborted, "daemon 受管任务超时，已中止并标记未确认 run");
+    }
+    state.active.lock().await.clear();
+    let uncertain = state.run_store.recover()?;
+    if uncertain > 0 {
+        tracing::warn!(uncertain, "关闭时将未确认 run 标为 unknown_after_restart");
     }
     state.join_background().await;
     paths.cleanup().await;
@@ -132,7 +149,7 @@ pub async fn run_unix_server(
 async fn serve_unix_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let (frames, mut frame_receiver) = mpsc::unbounded_channel::<ServerFrame>();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = AbortOnDrop(tokio::spawn(async move {
         while let Some(frame) = frame_receiver.recv().await {
             let encoded = match encode_frame(&frame) {
                 Ok(encoded) => encoded,
@@ -152,7 +169,7 @@ async fn serve_unix_connection(stream: UnixStream, state: Arc<DaemonState>) -> R
             writer.flush().await.context("刷新 daemon 响应失败")?;
         }
         Ok::<(), anyhow::Error>(())
-    });
+    }));
 
     let mut reader = BufReader::new(reader);
     loop {
@@ -184,13 +201,25 @@ async fn serve_unix_connection(stream: UnixStream, state: Arc<DaemonState>) -> R
             }
         };
         let request_frames = frames.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            state.handle_request(request, request_frames).await;
-        });
+        let request_id = request.id.clone();
+        let owner = state.clone();
+        if !state
+            .spawn_owned(async move {
+                owner.handle_request(request, request_frames).await;
+            })
+            .await
+        {
+            let _ = frames.send(ServerFrame::Response(JsonRpcResponse::failure(
+                request_id,
+                -32001,
+                "daemon 正在关闭",
+            )));
+        }
     }
     drop(frames);
-    writer_task.await.context("daemon 响应写入任务异常终止")??;
+    (&mut writer_task.0)
+        .await
+        .context("daemon 响应写入任务异常终止")??;
     Ok(())
 }
 
@@ -229,6 +258,7 @@ mod tests {
 
     struct ApprovalTool {
         approvals: ApprovalBroker,
+        side_effects: Arc<AtomicUsize>,
     }
 
     struct SuccessfulCronRunner;
@@ -256,6 +286,7 @@ mod tests {
 
         async fn execute(&self, _args: Value) -> Result<String> {
             if self.approvals.request("执行断线恢复测试动作").await? {
+                self.side_effects.fetch_add(1, Ordering::SeqCst);
                 Ok("approved".to_owned())
             } else {
                 anyhow::bail!("测试动作被拒绝")
@@ -285,6 +316,64 @@ mod tests {
         provider: Arc<dyn Provider>,
     ) -> (Arc<DaemonState>, std::path::PathBuf) {
         state_with_provider_and_skills(provider, None).await
+    }
+
+    #[tokio::test]
+    async fn owned_request_tasks_abort_after_grace_and_reject_new_work() {
+        let (state, session_path) = state_with_provider(Arc::new(PendingProvider)).await;
+        assert!(
+            state
+                .spawn_owned(async { std::future::pending::<()>().await })
+                .await
+        );
+        state.shutdown.cancel();
+        assert_eq!(state.join_owned(Duration::from_millis(10)).await, 1);
+        assert!(!state.spawn_owned(async {}).await);
+        let _ = std::fs::remove_file(session_path);
+    }
+
+    #[tokio::test]
+    async fn unknown_run_can_be_audited_and_reconciled_over_rpc() {
+        let (state, session_path) = test_state().await;
+        let session_id = crate::storage::SessionId(state.default_session.id.clone());
+        let crate::storage::Admission::New(run) = state
+            .run_store
+            .admit(
+                session_id.clone(),
+                RequestId::String("manual-repair".into()),
+                "work",
+            )
+            .unwrap()
+        else {
+            panic!("new run")
+        };
+        assert!(state.run_store.try_start_queued(&run.run_id).unwrap());
+        assert_eq!(state.run_store.recover().unwrap(), 1);
+        let client = InMemoryServer::start(state.clone());
+        let audit =
+            crate::entry::cli::request_result(&client, "run.audit", json!({"run_id":run.run_id}))
+                .await
+                .unwrap();
+        assert_eq!(audit["control_status"], "unknown_after_restart");
+        assert_eq!(audit["jsonl_is_authoritative"], false);
+        let last_seq = audit["last_seq"].as_u64().unwrap();
+        let fixed = crate::entry::cli::request_result(
+            &client,
+            "run.reconcile",
+            json!({
+                "run_id":run.run_id, "session_id":session_id, "expected_last_seq":last_seq,
+                "status":"failed", "evidence":"verified no external side effect"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixed["run"]["status"], "failed");
+        let read =
+            crate::entry::cli::request_result(&client, "run.read", json!({"run_id":run.run_id}))
+                .await
+                .unwrap();
+        assert_eq!(read["status"], "failed");
+        let _ = std::fs::remove_file(session_path);
     }
 
     #[tokio::test]
@@ -894,6 +983,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_reaps_active_request_and_persists_terminal_state() {
+        let (state, session_path) = state_with_provider(Arc::new(PendingProvider)).await;
+        let runtime_directory = std::env::temp_dir().join(format!(
+            "my-agent-stop-active-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::SeqCst)
+        ));
+        let paths = RuntimePaths::for_test(runtime_directory.clone());
+        let server_paths = paths.clone();
+        let workspace = std::env::current_dir().unwrap();
+        let state_for_server = state.clone();
+        let server = tokio::spawn(async move {
+            run_unix_server(state_for_server, &server_paths, &workspace).await
+        });
+        for _ in 0..100 {
+            if paths.socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = DaemonClient::connect_unix(&paths.socket).await.unwrap();
+        let mut chat = client
+            .request("chat.send", json!({"message":"一直等待"}))
+            .await
+            .unwrap();
+        let run_id = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), chat.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let ServerFrame::Event(event) = frame
+                && event.event == EventKind::TurnStarted
+            {
+                break event.run_id.unwrap();
+            }
+        };
+        let mut stop = client.request("daemon.stop", json!({})).await.unwrap();
+        let Some(ServerFrame::Response(response)) = stop.next().await else {
+            panic!("关闭响应")
+        };
+        assert!(response.error.is_none());
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let run = state.run_store.read_run(&run_id).unwrap().unwrap();
+        assert!(matches!(
+            run.status,
+            crate::storage::RunStatus::Cancelled | crate::storage::RunStatus::UnknownAfterRestart
+        ));
+        let _ = std::fs::remove_file(session_path);
+        let _ = std::fs::remove_dir_all(runtime_directory);
+    }
+
+    #[tokio::test]
     async fn dropped_stream_can_resubscribe_and_resolve_pending_approval() {
         let id = NEXT_TEST.fetch_add(1, Ordering::SeqCst);
         let session_path = std::env::temp_dir().join(format!(
@@ -911,9 +1056,11 @@ mod tests {
             ])),
         });
         let approvals = ApprovalBroker::new();
+        let side_effects = Arc::new(AtomicUsize::new(0));
         let mut tools = ToolRegistry::new();
         tools.register(ApprovalTool {
             approvals: approvals.clone(),
+            side_effects: side_effects.clone(),
         });
         let session = Arc::new(SessionStore::new(&session_path));
         let context = ContextManager::new(
@@ -1045,6 +1192,210 @@ mod tests {
         assert_eq!(receipts["receipts"][0]["receipt"]["output"], "approved");
         let artifact = receipts["receipts"][0]["artifact_ref"].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(artifact).unwrap(), "approved");
+        assert_eq!(side_effects.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(session_path);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_approval_prevents_tool_side_effect() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::SeqCst);
+        let session_path = std::env::temp_dir().join(format!(
+            "my-agent-approval-cancel-{}-{id}.jsonl",
+            std::process::id()
+        ));
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                Response::ToolCalls(vec![crate::provider::ToolCall {
+                    id: "cancel-danger".to_owned(),
+                    name: "danger".to_owned(),
+                    arguments: json!({}),
+                }]),
+                Response::Text("不应到达".to_owned()),
+            ])),
+        });
+        let approvals = ApprovalBroker::new();
+        let side_effects = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(ApprovalTool {
+            approvals: approvals.clone(),
+            side_effects: side_effects.clone(),
+        });
+        let session = Arc::new(SessionStore::new(&session_path));
+        let context = ContextManager::new(
+            provider.clone(),
+            std::env::current_dir().unwrap(),
+            ContextConfig {
+                token_budget: 1_000_000,
+                recent_messages: 100,
+                mild_compression_percent: 60,
+                strong_compression_percent: 85,
+                summary_chunk_tokens: 100_000,
+            },
+            Arc::new(PlanStore::memory_only()),
+        )
+        .unwrap();
+        let engine = Arc::new(LoopEngine::new(provider, tools, context, session.clone()));
+        let state = Arc::new(DaemonState::new(engine, Vec::new(), session, approvals));
+        let client = InMemoryServer::start(state);
+        let mut chat = client
+            .request_with_id(
+                RequestId::String("cancel-approval".into()),
+                "chat.send",
+                json!({"message":"执行危险动作"}),
+            )
+            .await
+            .unwrap();
+        let interaction = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), chat.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let ServerFrame::Event(event) = frame
+                && event.event == EventKind::ApprovalRequired
+            {
+                break event.data["interaction"].clone();
+            }
+        };
+        let run_id = interaction["owner_run_id"].as_str().unwrap();
+        let session_id = interaction["session_id"].as_str().unwrap();
+        let cancelled = crate::entry::cli::request_result(
+            &client,
+            "agent.cancel",
+            json!({"run_id":run_id,"session_id":session_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled["cancelled"], true);
+        let response = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), chat.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let ServerFrame::Response(response) = frame {
+                break response;
+            }
+        };
+        assert!(matches!(response.error.unwrap().code, -32800 | -32002));
+        let mut answer = client
+            .request(
+                "interaction.respond",
+                json!({"interaction_id":interaction["interaction_id"],
+            "session_id":session_id,"owner_run_id":run_id,"revision":0,"approved":true}),
+            )
+            .await
+            .unwrap();
+        let Some(ServerFrame::Response(answer)) = answer.next().await else {
+            panic!("审批响应")
+        };
+        assert!(answer.error.is_some());
+        assert_eq!(side_effects.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_file(session_path);
+    }
+
+    #[tokio::test]
+    async fn approval_and_cancel_race_never_confirms_cancel_after_side_effect() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::SeqCst);
+        let session_path = std::env::temp_dir().join(format!(
+            "my-agent-approval-race-{}-{id}.jsonl",
+            std::process::id()
+        ));
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                Response::ToolCalls(vec![crate::provider::ToolCall {
+                    id: "race-danger".to_owned(),
+                    name: "danger".to_owned(),
+                    arguments: json!({}),
+                }]),
+                Response::Text("已完成".to_owned()),
+            ])),
+        });
+        let approvals = ApprovalBroker::new();
+        let side_effects = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(ApprovalTool {
+            approvals: approvals.clone(),
+            side_effects: side_effects.clone(),
+        });
+        let session = Arc::new(SessionStore::new(&session_path));
+        let context = ContextManager::new(
+            provider.clone(),
+            std::env::current_dir().unwrap(),
+            ContextConfig {
+                token_budget: 1_000_000,
+                recent_messages: 100,
+                mild_compression_percent: 60,
+                strong_compression_percent: 85,
+                summary_chunk_tokens: 100_000,
+            },
+            Arc::new(PlanStore::memory_only()),
+        )
+        .unwrap();
+        let engine = Arc::new(LoopEngine::new(provider, tools, context, session.clone()));
+        let state = Arc::new(DaemonState::new(engine, Vec::new(), session, approvals));
+        let client = InMemoryServer::start(state);
+        let mut chat = client
+            .request_with_id(
+                RequestId::String("race-approval".into()),
+                "chat.send",
+                json!({"message":"执行动作"}),
+            )
+            .await
+            .unwrap();
+        let interaction = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), chat.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let ServerFrame::Event(event) = frame
+                && event.event == EventKind::ApprovalRequired
+            {
+                break event.data["interaction"].clone();
+            }
+        };
+        let run_id = interaction["owner_run_id"].as_str().unwrap().to_owned();
+        let session_id = interaction["session_id"].as_str().unwrap().to_owned();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let cancel_client = client.clone();
+        let cancel_barrier = barrier.clone();
+        let cancel_params = json!({"run_id":run_id,"session_id":session_id});
+        let cancel_task = tokio::spawn(async move {
+            cancel_barrier.wait().await;
+            crate::entry::cli::request_result(&cancel_client, "agent.cancel", cancel_params).await
+        });
+        let answer_client = client.clone();
+        let answer_barrier = barrier.clone();
+        let answer_params = json!({"interaction_id":interaction["interaction_id"],
+            "session_id":session_id,"owner_run_id":run_id,"revision":0,"approved":true});
+        let answer_task = tokio::spawn(async move {
+            answer_barrier.wait().await;
+            crate::entry::cli::request_result(&answer_client, "interaction.respond", answer_params)
+                .await
+        });
+        barrier.wait().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), cancel_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), answer_task)
+            .await
+            .unwrap()
+            .unwrap();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), chat.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(frame, ServerFrame::Response(_)) {
+                break;
+            }
+        }
+        let run = crate::entry::cli::request_result(&client, "run.read", json!({"run_id":run_id}))
+            .await
+            .unwrap();
+        if side_effects.load(Ordering::SeqCst) > 0 {
+            assert_ne!(run["status"], "cancelled", "已经执行工具，却报告确认取消");
+        }
+        assert!(side_effects.load(Ordering::SeqCst) <= 1);
         let _ = std::fs::remove_file(session_path);
     }
 }

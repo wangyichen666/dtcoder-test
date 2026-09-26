@@ -55,13 +55,13 @@ impl Tool for EditFileTool {
         if args.old_text.is_empty() {
             bail!("old_text 不能为空");
         }
-        let path = self
+        let authorized = self
             .safety
-            .authorize_path(&args.path, PathIntent::Edit)
+            .authorize_file(&args.path, PathIntent::Edit)
             .await?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("读取待编辑文件失败: {}", path.display()))?;
+        let content = authorized
+            .read_to_string()
+            .with_context(|| format!("读取待编辑文件失败: {}", authorized.path().display()))?;
         let count = content.matches(&args.old_text).count();
         if count == 0 {
             bail!("未找到 old_text，文件未修改");
@@ -69,15 +69,17 @@ impl Tool for EditFileTool {
         if count > 1 && !args.replace_all {
             bail!("old_text 出现 {count} 次；请提供更精确的文本或设置 replace_all=true");
         }
-
         let updated = if args.replace_all {
             content.replace(&args.old_text, &args.new_text)
         } else {
             content.replacen(&args.old_text, &args.new_text, 1)
         };
-        tokio::fs::write(&path, updated)
-            .await
-            .with_context(|| format!("写回编辑结果失败: {}", path.display()))?;
-        Ok(format!("已编辑 {}，替换 {count} 处", path.display()))
+        authorized
+            .atomic_write(updated.as_bytes())
+            .with_context(|| format!("写回编辑结果失败: {}", authorized.path().display()))?;
+        Ok(format!(
+            "已编辑 {}，替换 {count} 处",
+            authorized.path().display()
+        ))
     }
 }

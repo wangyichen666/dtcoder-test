@@ -1,6 +1,7 @@
 mod edit;
 mod exec;
 mod read;
+mod sandbox;
 mod write;
 
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use crate::provider::{Message, ToolSpec};
 pub use edit::EditFileTool;
 pub use exec::ExecTool;
 pub use read::ReadFileTool;
+pub use sandbox::{ExecRequest, NativeSandbox, Sandbox, SandboxBackend};
 pub use write::WriteFileTool;
 
 #[async_trait]
@@ -50,6 +52,8 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn execute(&self, args: Value) -> Result<String>;
+
+    fn stop_resources(&self) {}
 
     async fn execute_rich(&self, args: Value) -> Result<ToolOutput> {
         self.execute(args).await.map(ToolOutput::text)
@@ -99,6 +103,12 @@ impl ToolRegistry {
         T: Tool + 'static,
     {
         self.tools.insert(tool.name().to_owned(), Arc::new(tool));
+    }
+
+    pub fn stop_resources(&self) {
+        for tool in self.tools.values() {
+            tool.stop_resources();
+        }
     }
 
     pub fn register_dynamic_source<T>(&mut self, source: Arc<T>)

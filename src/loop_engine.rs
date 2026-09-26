@@ -126,6 +126,10 @@ pub struct LoopEngine {
 }
 
 impl LoopEngine {
+    pub fn stop_resources(&self) {
+        self.tools.stop_resources();
+    }
+
     pub fn new(
         provider: Arc<dyn Provider>,
         tools: ToolRegistry,

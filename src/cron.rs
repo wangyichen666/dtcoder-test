@@ -399,10 +399,16 @@ impl CronManager {
     }
 
     pub async fn join(&self) {
-        if let Some(task) = self.task.lock().await.take()
-            && let Err(error) = task.await
-        {
-            warn!(%error, "cron 调度任务异常终止");
+        if let Some(mut task) = self.task.lock().await.take() {
+            match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+                Ok(Err(error)) if !error.is_cancelled() => warn!(%error, "cron 调度任务异常终止"),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    warn!("cron 调度任务关闭超时，已中止");
+                }
+                _ => {}
+            }
         }
     }
 

@@ -253,10 +253,10 @@ Cron：
 - **受控长任务**：主任务没有固定 ReAct 轮次上限，每 50 轮检查进度；完全相同调用与结果连续 10 次才按无进展熔断。
 - **失败恢复**：工具失败会回填模型修复；连续 3 次工具失败则终止并返回明确原因。
 - **断线恢复**：daemon 在工作区 `.my-agent/runtime.sqlite3` 中保存 run、turn、队列、工具回执、事件序号、交互和终态。`agent.subscribe` 先回放持久事件，再接实时通知；缺口以 `resync_required` 返回 snapshot、`last_seq` 和分页游标。`run.read` / `run.events` 可在重启后查询。旧 JSONL 对话和 trace 保留。
-- **不确定结果**：daemon 重启时，已启动但未确认终态的 run 标为 `unknown_after_restart`，未启动的 queued run 保留并由 daemon 恢复调度。运行中的未知副作用不自动重放。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
-- **工具回执与诊断**：工具批次在执行前写入 prepared，每个调用在执行前转为 running，结束后提交 typed outcome、最多 4096 字符的预览与本地完整输出 artifact 路径。`run.tools` 查看回执；`run.audit` 比较 SQLite 控制终态与 JSONL 可读副本并报告疑似分歧。JSONL 匹配仅用于诊断，不能证明 run 成功。
+- **不确定结果**：daemon 重启时，已启动但未确认终态的 run 标为 `unknown_after_restart`，未启动的 queued run 保留并由 daemon 恢复调度。取消发生在副作用工具开始之后时也记为未知，避免已经执行工具却确认取消。未知副作用不自动重放。可用 `/run <run_id>` 从 CLI 或 ACP 查询；WebSocket 可调用同一个 `run.read` RPC。
+- **工具回执与诊断**：工具批次在执行前写入 prepared，每个调用在执行前转为 running，结束后提交 typed outcome、最多 4096 字符的预览与本地完整输出 artifact 路径。`run.tools` 查看回执；`run.audit` 对照 SQLite、JSONL、trace 与 artifact 摘要并报告分歧。JSONL 匹配仅用于诊断，不能证明 run 成功。人工核实后可用 `run.reconcile` 记录显式修复。
 - **平滑升级**：ready 标记记录可执行文件内容指纹；重新构建后会优雅停止旧 daemon，再使用新版本启动。
-- **进程清理**：`exec` 默认 300 秒超时；取消或超时会清理整个子进程组。
+- **进程清理**：`exec` 默认 300 秒超时；取消或超时会清理整个子进程组。stdout/stderr 持续排空，每路只保留前 64 KiB；daemon 关闭时停止已登记的前台进程。
 
 ### 控制面 RPC（JSON-RPC 2.0）
 
@@ -268,8 +268,9 @@ Cron：
 | `interaction.list` / `interaction.read` | `session_id` / `interaction_id` | 返回 owner、kind、status、revision 和类型化 payload |
 | `interaction.respond` / `interaction.reject` | `interaction_id`, `session_id`, `owner_run_id`, `revision`；respond 还需 `approved` | 先持久 claim 再唤醒；相同答案幂等，冲突答案拒绝。旧 `approval.respond` 仍可用 |
 | `run.read` / `run.events` / `run.tools` / `run.audit` | `run_id`；events 可带 `after_seq/limit` | 状态、分页事件、工具回执、一致性诊断 |
+| `run.reconcile` | `session_id`, `run_id`, `expected_last_seq`, `status`, `evidence`；completed 需 `content` | 只修复 unknown run；校验 owner 与事件序号，记录证据摘要和人工决议 |
 
-新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`steer`、强沙箱、可恢复子 Agent 仍属于后续阶段。
+新客户端应保存 `run_id` 和事件 `seq`。传输断线或 HTTP 等待超时只结束本次等待；重新连接后用 `run.read`、`queue.list` 与 `agent.subscribe(after_seq)` 读取事实。审批在 daemon 重启后会标为 orphaned，原 LLM 执行体不会自动恢复。`run.reconcile` 仅供本地操作者在检查 `run.audit` 后使用，不会自动重放工具或修改旧 JSONL。`steer`、强沙箱、可恢复子 Agent 仍属于后续阶段。
 
 ## 安全边界
 
@@ -280,12 +281,17 @@ Cron：
 | 工作区内读取 | 直接允许，可进入最多 8 路只读并行波次。 |
 | 工作区外读取 | 直接拒绝。 |
 | 工作区外写入/编辑 | 请求人工审批，默认拒绝。 |
+| `.git` 与工作区 `.my-agent` 内写入、硬链接写入 | 所有权限模式均拒绝。 |
+| 内置文件工具 | Unix 上使用授权后的目录/文件句柄、no-follow、身份与内容复核；写入同目录临时文件并原子替换。 |
+| `exec` | 明确使用 `/bin/sh -c` 与工作区 cwd，只传入 PATH/HOME/TMPDIR/LANG/LC_ALL/TERM/CARGO_HOME/RUSTUP_HOME，并显式设置 PWD；可请求 `sandbox=native`，请求 `docker` 会报未实现。 |
 | `rm -rf /`、`mkfs`、块设备覆盖、fork 炸弹等 | 硬拒绝。 |
 | `kill`、`sudo`、`git reset --hard`、`cargo publish` 等 | 请求人工审批。 |
 | Cron 中任何需审批动作 | 无人值守安全拒绝。 |
 | 非回环 HTTP/WebSocket | 必须配置 Bearer Token。 |
 
-MCP server 以当前用户权限运行，只应连接可信本地配置。图片/PDF 限制 16 MiB；PDF 最多抽取 50 页和约 512K 字符，不做视觉渲染。
+MCP server 以当前用户权限运行，只应连接可信本地配置。内置文件读取上限 32 MiB；图片/PDF 另限 16 MiB；PDF 最多抽取 50 页和约 512K 字符，不做视觉渲染。
+
+Native backend 是软边界；Shell 命令及同用户进程仍能直接访问宿主文件。文件句柄检查能拒绝已检测到的路径替换，但无法提供容器级隔离。Docker backend 与后台进程登记尚未提供。
 
 ## 配置参考
 

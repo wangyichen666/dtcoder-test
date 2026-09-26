@@ -260,7 +260,7 @@ impl RunStore {
         }
         Ok(Self {
             connection: Mutex::new(connection),
-            artifact_dir: path.with_file_name("tool-artifacts"),
+            artifact_dir: path.with_extension("artifacts"),
         })
     }
 
@@ -798,7 +798,14 @@ impl RunStore {
             params![run_id.0],
             |row| row.get(0),
         )?;
-        let status = if incomplete_tools > 0 {
+        let started_side_effects: i64 = transaction.query_row(
+            "SELECT count(*) FROM tool_executions WHERE run_id=?1 AND effect!='read' AND status IN ('running','terminal')",
+            params![run_id.0],
+            |row| row.get(0),
+        )?;
+        let status = if incomplete_tools > 0
+            || (status == RunStatus::Cancelled && started_side_effects > 0)
+        {
             RunStatus::UnknownAfterRestart
         } else {
             status
@@ -839,6 +846,76 @@ impl RunStore {
         )?;
         transaction.execute("UPDATE interactions SET status='orphaned', revision=revision+1 WHERE run_id=?1 AND status='pending'", params![run_id.0])?;
         let result = read_run_in(&transaction, &run_id.0)?.expect("run still exists");
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn reconcile_unknown(
+        &self,
+        run_id: &RunId,
+        session_id: &SessionId,
+        expected_last_seq: EventSeq,
+        status: RunStatus,
+        content: Option<&str>,
+        evidence: &str,
+    ) -> Result<RunRecord, RuntimeError> {
+        if !matches!(
+            status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) || evidence.trim().chars().count() < 16
+            || evidence.len() > 4096
+            || (status == RunStatus::Completed && content.is_none_or(str::is_empty))
+        {
+            return Err(RuntimeError::Protocol(
+                "人工修复需要明确终态、内容和 16-4096 字节证据说明".into(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("SQLite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let run = read_run_in(&transaction, &run_id.0)?
+            .ok_or_else(|| RuntimeError::Protocol("run 不存在".into()))?;
+        if run.session_id != *session_id
+            || run.status != RunStatus::UnknownAfterRestart
+            || run.last_seq != expected_last_seq
+        {
+            return Err(RuntimeError::Protocol(
+                "run owner、状态或事件序号冲突".into(),
+            ));
+        }
+        let digest = format!("{:x}", Sha256::digest(evidence.as_bytes()));
+        if let Some(content) = content.filter(|_| status == RunStatus::Completed) {
+            insert_event(
+                &transaction,
+                run_id,
+                "assistant_content",
+                &serde_json::json!({"content": content, "manual": true}),
+            )?;
+        }
+        insert_event(
+            &transaction,
+            run_id,
+            "manual_resolution",
+            &serde_json::json!({
+            "from": "unknown_after_restart", "status": status, "evidence_sha256": digest,
+            "evidence_note": evidence, "previous_last_seq": expected_last_seq}),
+        )?;
+        let (error_code, error_message): (Option<i64>, Option<&str>) = match status {
+            RunStatus::Completed => (None, None),
+            RunStatus::Failed => (Some(-32003), Some("人工核验为失败")),
+            RunStatus::Cancelled => (Some(-32800), Some("人工核验为取消")),
+            _ => unreachable!(),
+        };
+        transaction.execute("UPDATE runs SET status=?2, content=?3, error_code=?4, error_message=?5, updated_at_ms=?6 WHERE id=?1",
+            params![run_id.0, status.as_str(), content.filter(|_| status == RunStatus::Completed), error_code, error_message, now_ms()])?;
+        transaction.execute(
+            "UPDATE turns SET status=?2 WHERE run_id=?1",
+            params![run_id.0, status.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE queued_messages SET status=?2 WHERE run_id=?1",
+            params![run_id.0, status.as_str()],
+        )?;
+        let result = read_run_in(&transaction, &run_id.0)?.expect("reconciled run");
         transaction.commit()?;
         Ok(result)
     }
@@ -1327,6 +1404,140 @@ mod tests {
                 .unwrap()
                 .contains("done")
         );
+    }
+
+    #[test]
+    fn manual_resolution_requires_exact_owner_and_event_cursor() {
+        let path = path();
+        let store = RunStore::open(&path).unwrap();
+        let Admission::New(run) = store
+            .admit(SessionId("repair".into()), RequestId::Number(1), "do work")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        drop(store);
+        let reopened = RunStore::open(&path).unwrap();
+        assert_eq!(reopened.recover().unwrap(), 1);
+        let unknown = reopened.read_run(&run.run_id).unwrap().unwrap();
+        assert!(
+            reopened
+                .reconcile_unknown(
+                    &run.run_id,
+                    &SessionId("wrong".into()),
+                    unknown.last_seq,
+                    RunStatus::Completed,
+                    Some("done"),
+                    "confirmed from external system"
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .reconcile_unknown(
+                    &run.run_id,
+                    &run.session_id,
+                    EventSeq(0),
+                    RunStatus::Completed,
+                    Some("done"),
+                    "confirmed from external system"
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .reconcile_unknown(
+                    &run.run_id,
+                    &run.session_id,
+                    unknown.last_seq,
+                    RunStatus::Completed,
+                    Some("done"),
+                    "short"
+                )
+                .is_err()
+        );
+        let resolved = reopened
+            .reconcile_unknown(
+                &run.run_id,
+                &run.session_id,
+                unknown.last_seq,
+                RunStatus::Completed,
+                Some("done"),
+                "confirmed from external system",
+            )
+            .unwrap();
+        assert_eq!(resolved.status, RunStatus::Completed);
+        assert_eq!(resolved.content.as_deref(), Some("done"));
+        assert!(
+            reopened
+                .events_after(&run.run_id, unknown.last_seq, 10)
+                .unwrap()
+                .iter()
+                .any(|event| event.event == "manual_resolution")
+        );
+        assert!(
+            reopened
+                .reconcile_unknown(
+                    &run.run_id,
+                    &run.session_id,
+                    unknown.last_seq,
+                    RunStatus::Failed,
+                    None,
+                    "different external evidence"
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cancellation_after_confirmed_side_effect_is_not_confirmed_cancel() {
+        let store = RunStore::open(&path()).unwrap();
+        let Admission::New(run) = store
+            .admit(
+                SessionId("effect-cancel".into()),
+                RequestId::Number(1),
+                "write",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(store.try_start_queued(&run.run_id).unwrap());
+        let call = ToolCall {
+            id: "write-1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path":"x","content":"y"}),
+        };
+        store
+            .prepare_tool_batch(
+                &run.run_id,
+                1,
+                &[(call, "external_side_effect".into(), "digest".into(), false)],
+            )
+            .unwrap();
+        store.start_tool(&run.run_id, 1, "write-1").unwrap();
+        store
+            .finish_tool(
+                &run.run_id,
+                1,
+                "write-1",
+                "success",
+                None,
+                &serde_json::json!({"success":true}),
+            )
+            .unwrap();
+        store.finish_tool_batch(&run.run_id, 1).unwrap();
+        let finished = store
+            .finish(
+                &run.run_id,
+                RunStatus::Cancelled,
+                None,
+                Some((-32800, "cancelled")),
+            )
+            .unwrap();
+        assert_eq!(finished.status, RunStatus::UnknownAfterRestart);
+        assert_eq!(finished.error_code, Some(-32002));
     }
 
     #[test]

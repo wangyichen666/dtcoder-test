@@ -6,11 +6,13 @@ pub mod runtime;
 pub mod server;
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::task::JoinSet;
 
 use self::approval::ApprovalBroker;
 use self::protocol::{EventFrame, EventKind, JsonRpcResponse, RequestId, ServerFrame};
@@ -32,6 +34,7 @@ pub struct DaemonState {
     pub(crate) approvals: ApprovalBroker,
     pub(crate) safety: Option<Arc<SafetyPolicy>>,
     pub(crate) active: Mutex<HashMap<ActiveKey, ActiveRequest>>,
+    pub(crate) request_tasks: Mutex<JoinSet<()>>,
     pub(crate) queue_notify: Notify,
     pub(crate) control_lock: Mutex<()>,
     pub(crate) run_store: Arc<RunStore>,
@@ -289,6 +292,7 @@ impl DaemonState {
             approvals,
             safety,
             active: Mutex::new(HashMap::new()),
+            request_tasks: Mutex::new(JoinSet::new()),
             queue_notify: Notify::new(),
             control_lock: Mutex::new(()),
             run_store,
@@ -304,6 +308,41 @@ impl DaemonState {
 
     pub async fn has_active_turns(&self) -> bool {
         !self.active.lock().await.is_empty()
+    }
+
+    pub(crate) async fn spawn_owned<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.request_tasks.lock().await;
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(%error, "受管 daemon 任务异常结束");
+            }
+        }
+        tasks.spawn(future);
+        true
+    }
+
+    pub(crate) async fn join_owned(&self, grace: std::time::Duration) -> usize {
+        let mut tasks = self.request_tasks.lock().await;
+        let joined = async {
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "受管 daemon 任务异常结束");
+                }
+            }
+        };
+        if tokio::time::timeout(grace, joined).await.is_ok() {
+            return 0;
+        }
+        let aborted = tasks.len();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        aborted
     }
 
     pub async fn has_persistent_background_work(&self) -> bool {

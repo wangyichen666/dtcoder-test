@@ -1,5 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -57,19 +57,26 @@ impl ReadFileTool {
             .await?;
         match file_kind(&path) {
             FileKind::Image(mime_type) if self.multimodal_enabled => {
-                read_image(path, mime_type).await
+                let authorized = self.safety.authorize_file(&path, PathIntent::Read).await?;
+                read_image(&authorized, mime_type)
             }
             FileKind::Image(_) => Ok(ToolOutput::text(format!(
                 "当前模型未启用多模态图片输入，无法解析图片：{}。请设置 MULTIMODAL_ENABLED=true 或使用名称含 vision 的 MODEL_NAME。",
                 path.display()
             ))),
-            FileKind::Pdf => read_pdf(path).await.map(ToolOutput::text),
+            FileKind::Pdf => {
+                let authorized = self.safety.authorize_file(&path, PathIntent::Read).await?;
+                read_pdf(&authorized).await.map(ToolOutput::text)
+            }
             FileKind::UnsupportedMedia(kind) => Ok(ToolOutput::text(format!(
                 "当前版本不解析{kind}文件：{}。支持的图片格式为 PNG/JPG/JPEG/WebP，PDF 会在本地抽取文字。",
                 path.display()
             ))),
-            FileKind::Text => tokio::fs::read_to_string(&path)
-                .await
+            FileKind::Text => self
+                .safety
+                .authorize_file(&path, PathIntent::Read)
+                .await?
+                .read_to_string()
                 .with_context(|| format!("读取文件失败: {}", path.display()))
                 .map(ToolOutput::text),
         }
@@ -138,14 +145,14 @@ fn file_kind(path: &Path) -> FileKind {
     }
 }
 
-async fn read_image(path: PathBuf, mime_type: &'static str) -> Result<ToolOutput> {
-    ensure_size(&path).await?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("读取图片失败: {}", path.display()))?;
+fn read_image(path: &crate::safety::AuthorizedPath, mime_type: &'static str) -> Result<ToolOutput> {
+    ensure_size(path)?;
+    let bytes = path
+        .read_bytes()
+        .with_context(|| format!("读取图片失败: {}", path.path().display()))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let data_url = format!("data:{mime_type};base64,{encoded}");
-    let display = path.display().to_string();
+    let display = path.path().display().to_string();
     Ok(ToolOutput {
         content: format!(
             "已读取图片 {display}，图像内容已作为下一次模型请求的临时用户内容块提供。"
@@ -157,17 +164,18 @@ async fn read_image(path: PathBuf, mime_type: &'static str) -> Result<ToolOutput
     })
 }
 
-async fn read_pdf(path: PathBuf) -> Result<String> {
-    ensure_size(&path).await?;
-    let display = path.display().to_string();
-    tokio::task::spawn_blocking(move || extract_pdf_text(&path))
+async fn read_pdf(path: &crate::safety::AuthorizedPath) -> Result<String> {
+    ensure_size(path)?;
+    let display = path.path().display().to_string();
+    let bytes = path.read_bytes()?;
+    tokio::task::spawn_blocking(move || extract_pdf_text(&bytes))
         .await
         .context("PDF 文本抽取任务异常终止")?
         .with_context(|| format!("解析 PDF 失败: {display}"))
 }
 
-fn extract_pdf_text(path: &Path) -> Result<String> {
-    let document = lopdf::Document::load(path)?;
+fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
+    let document = lopdf::Document::load_mem(bytes)?;
     let page_numbers = document.get_pages().keys().copied().collect::<Vec<u32>>();
     if page_numbers.len() > MAX_PDF_PAGES {
         bail!(
@@ -180,16 +188,14 @@ fn extract_pdf_text(path: &Path) -> Result<String> {
     Ok(truncate_chars(&text, MAX_PDF_TEXT_CHARS))
 }
 
-async fn ensure_size(path: &Path) -> Result<()> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("读取文件元数据失败: {}", path.display()))?;
-    if metadata.len() > MAX_MEDIA_BYTES {
+fn ensure_size(path: &crate::safety::AuthorizedPath) -> Result<()> {
+    let size = path.size()?;
+    if size > MAX_MEDIA_BYTES {
         bail!(
             "文件大小 {} 字节，超过 {} MiB 限制: {}",
-            metadata.len(),
+            size,
             MAX_MEDIA_BYTES / 1024 / 1024,
-            path.display()
+            path.path().display()
         );
     }
     Ok(())

@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+#[cfg(unix)]
+mod file_access;
+#[cfg(unix)]
+pub use file_access::AuthorizedPath;
+
+pub type FileAccessIntent = PathIntent;
+
 #[derive(Clone, Copy, Debug)]
 pub enum PathIntent {
     Read,
@@ -92,6 +99,8 @@ pub enum SafetyError {
     UserRejected(String),
     #[error("无法解析路径: {0}")]
     InvalidPath(PathBuf),
+    #[error("受保护路径禁止写入: {0}")]
+    ProtectedPath(PathBuf),
 }
 
 #[async_trait]
@@ -124,6 +133,10 @@ impl SafetyPolicy {
         }
     }
 
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     pub fn set_mode(&self, mode: SafetyMode) {
         self.mode.store(mode as u8, Ordering::Relaxed);
     }
@@ -134,6 +147,9 @@ impl SafetyPolicy {
         intent: PathIntent,
     ) -> Result<PathBuf> {
         let resolved = self.resolve_path(requested.as_ref())?;
+        if !matches!(intent, PathIntent::Read) && is_protected_path(&resolved, &self.workspace) {
+            return Err(SafetyError::ProtectedPath(resolved).into());
+        }
         let mode = self.mode();
         if mode == SafetyMode::FullAccess {
             return Ok(resolved);
@@ -159,6 +175,16 @@ impl SafetyPolicy {
         } else {
             Err(SafetyError::UserRejected(prompt).into())
         }
+    }
+
+    #[cfg(unix)]
+    pub async fn authorize_file(
+        &self,
+        requested: impl AsRef<Path>,
+        intent: FileAccessIntent,
+    ) -> Result<AuthorizedPath> {
+        let path = self.authorize_path(requested, intent).await?;
+        AuthorizedPath::open(path, intent)
     }
 
     pub async fn authorize_command(&self, command: &str) -> Result<()> {
@@ -271,6 +297,39 @@ impl SafetyPolicy {
     }
 }
 
+fn is_protected_path(path: &Path, workspace: &Path) -> bool {
+    let protected = workspace.join(".my-agent");
+    if path.starts_with(&protected) {
+        return true;
+    }
+    if [
+        "/etc",
+        "/private/etc",
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/dev",
+        "/proc",
+        "/sys",
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
+    {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if [".ssh", ".aws", ".gnupg"]
+            .iter()
+            .any(|name| path.starts_with(home.join(name)))
+        {
+            return true;
+        }
+    }
+    path.components().any(|part| part.as_os_str() == ".git")
+}
+
 fn is_command_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -373,6 +432,7 @@ fn contains_program(command: &str, programs: &[&str]) -> bool {
             character.is_whitespace() || matches!(character, ';' | '|' | '&' | '(' | ')')
         })
         .any(|token: &str| {
+            let token = shell_token_core(token);
             let base = token.rsplit('/').next().unwrap_or(token);
             programs
                 .iter()
@@ -392,10 +452,9 @@ fn is_catastrophic_rm(command: &str) -> bool {
         .iter()
         .any(|token: &&str| token.starts_with('-') && token.contains('f'));
     let catastrophic_target = tokens.iter().any(|token: &&str| {
-        matches!(
-            token.trim_matches(['\'', '"']),
-            "/" | "/*" | "~" | "~/" | "$home" | "${home}"
-        )
+        let raw = token.trim_matches(['\'', '"', '`', '(', ')', ';']);
+        matches!(shell_token_core(token), "/" | "/*" | "~" | "~/")
+            || matches!(raw, "$home" | "${home}")
     });
     recursive && force && catastrophic_target
 }
@@ -403,7 +462,11 @@ fn is_catastrophic_rm(command: &str) -> bool {
 fn targets_root(command: &str) -> bool {
     command
         .split_whitespace()
-        .any(|token: &str| matches!(token.trim_matches(['\'', '"']), "/" | "/*"))
+        .any(|token: &str| matches!(shell_token_core(token), "/" | "/*"))
+}
+
+fn shell_token_core(token: &str) -> &str {
+    token.trim_matches(['\'', '"', '`', '$', '(', ')', '{', '}', ';'])
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -478,6 +541,11 @@ mod tests {
             "find / -delete",
             "mv important /dev/null",
             "parted /dev/sda mklabel gpt",
+            "sh -c 'rm -rf /'",
+            "$(rm -rf /)",
+            "env rm -rf /",
+            "rm -rf $HOME",
+            "rm -rf \"${HOME}\"",
         ];
         for command in commands {
             assert!(
@@ -593,5 +661,51 @@ mod tests {
         policy.authorize_command("pkill my-server").await.unwrap();
         assert!(policy.authorize_command("rm -rf /").await.is_err());
         assert_eq!(approval.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn full_access_cannot_write_protected_paths() {
+        let approval = Arc::new(FixedApproval {
+            allowed: true,
+            calls: AtomicUsize::new(0),
+        });
+        let workspace = std::env::current_dir().unwrap();
+        let policy = SafetyPolicy::new(&workspace, approval).unwrap();
+        policy.set_mode(SafetyMode::FullAccess);
+        for path in [
+            workspace.join(".git/config"),
+            workspace.join(".my-agent/runtime.sqlite3"),
+            PathBuf::from("/etc/passwd"),
+        ] {
+            assert!(
+                policy
+                    .authorize_path(path, PathIntent::Write)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_components_cannot_bypass_workspace_boundary() {
+        let approval = Arc::new(FixedApproval {
+            allowed: false,
+            calls: AtomicUsize::new(0),
+        });
+        let workspace = std::env::current_dir().unwrap();
+        let policy = SafetyPolicy::new(&workspace, approval.clone()).unwrap();
+        assert!(
+            policy
+                .authorize_path("../outside.txt", PathIntent::Read)
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .authorize_path("../outside.txt", PathIntent::Write)
+                .await
+                .is_err()
+        );
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 1);
     }
 }
